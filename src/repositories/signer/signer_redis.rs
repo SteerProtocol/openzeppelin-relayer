@@ -201,7 +201,9 @@ impl Repository<SignerRepoModel, String> for RedisSignerRepository {
             .await
             .map_err(|e| self.map_redis_error(e, "create_signer_set"))?;
 
-        // Add to list
+        // add_to_list obtains another pooled connection. Release this one first
+        // so concurrent creates can also work when the pool is small.
+        drop(conn);
         self.add_to_list(&signer.id).await?;
 
         debug!(signer_id = %signer.id, "created signer");
@@ -479,14 +481,14 @@ mod tests {
         }
     }
 
-    async fn setup_test_repo() -> RedisSignerRepository {
+    async fn setup_test_repo_with_pool_size(pool_size: usize) -> RedisSignerRepository {
         let redis_url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
         let cfg = Config::from_url(&redis_url);
         let pool = Arc::new(
             cfg.builder()
                 .expect("Failed to create pool builder")
-                .max_size(16)
+                .max_size(pool_size)
                 .runtime(Runtime::Tokio1)
                 .build()
                 .expect("Failed to build Redis pool"),
@@ -497,6 +499,10 @@ mod tests {
         let key_prefix = format!("test_prefix:{random_id}");
 
         RedisSignerRepository::new(connections, key_prefix).expect("Failed to create repository")
+    }
+
+    async fn setup_test_repo() -> RedisSignerRepository {
+        setup_test_repo_with_pool_size(16).await
     }
 
     #[tokio::test]
@@ -569,6 +575,21 @@ mod tests {
 
         let created_signer = result.unwrap();
         assert_eq!(created_signer.id, signer_name);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires active Redis instance"]
+    async fn test_create_signer_with_single_connection() {
+        let repo = setup_test_repo_with_pool_size(1).await;
+        let signer_name = Uuid::new_v4().to_string();
+        let signer = create_local_signer(&signer_name);
+
+        let created = tokio::time::timeout(std::time::Duration::from_secs(5), repo.create(signer))
+            .await
+            .expect("signer creation must not wait for a second connection")
+            .expect("signer creation failed");
+        assert_eq!(created.id, signer_name);
+        assert_eq!(repo.get_by_id(signer_name).await.unwrap().id, created.id);
     }
 
     #[tokio::test]
