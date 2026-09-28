@@ -324,7 +324,8 @@ impl Repository<SignerRepoModel, String> for RedisSignerRepository {
             .await
             .map_err(|e| self.map_redis_error(e, "delete_signer"))?;
 
-        // Remove from list
+        // remove_from_list obtains another pooled connection.
+        drop(conn);
         self.remove_from_list(&id).await?;
 
         debug!(signer_id = %id, "deleted signer");
