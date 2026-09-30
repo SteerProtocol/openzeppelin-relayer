@@ -904,6 +904,7 @@ mod tests {
             private_transactions: Some(true),
             min_balance: Some(1000000000000000000),
             gas_limit_estimation: Some(true),
+            gas_limit_buffer_percent: None,
         });
 
         let result = repo.update_policy(relayer.id.clone(), new_policy).await;

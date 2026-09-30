@@ -87,6 +87,7 @@ mod tests {
             include_revert_data: None,
             min_balance: Some(min_balance),
             gas_limit_estimation: Some(true),
+            gas_limit_buffer_percent: None,
             gas_price_cap: None,
             whitelist_receivers: None,
             eip1559_pricing: None,

@@ -282,6 +282,7 @@ mod tests {
                 private_transactions: None,
                 min_balance: None,
                 gas_limit_estimation: None,
+                gas_limit_buffer_percent: None,
             })),
             signer_id: "test-signer".to_string(),
             notification_id: None,

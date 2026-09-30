@@ -63,6 +63,7 @@ pub mod mockutils {
                 private_transactions: Some(false),
                 min_balance: Some(0),
                 gas_limit_estimation: Some(false),
+                gas_limit_buffer_percent: None,
             }),
             signer_id: "test".to_string(),
             address: "0x742d35Cc6634C0532925a3b8D8C2e48a73F6ba2E".to_string(),

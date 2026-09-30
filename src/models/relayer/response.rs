@@ -19,7 +19,8 @@ use super::{
 };
 use crate::constants::{
     DEFAULT_EVM_GAS_LIMIT_ESTIMATION, DEFAULT_EVM_INCLUDE_REVERT_DATA, DEFAULT_EVM_MIN_BALANCE,
-    DEFAULT_SOLANA_MAX_TX_DATA_SIZE, DEFAULT_SOLANA_MIN_BALANCE, DEFAULT_STELLAR_MIN_BALANCE,
+    DEFAULT_GAS_LIMIT_BUFFER_PERCENT, DEFAULT_SOLANA_MAX_TX_DATA_SIZE, DEFAULT_SOLANA_MIN_BALANCE,
+    DEFAULT_STELLAR_MIN_BALANCE,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -333,6 +334,7 @@ fn is_empty_policy(policy: &RelayerNetworkPolicy) -> bool {
         RelayerNetworkPolicy::Evm(evm_policy) => {
             evm_policy.min_balance.is_none()
                 && evm_policy.gas_limit_estimation.is_none()
+                && evm_policy.gas_limit_buffer_percent.is_none()
                 && evm_policy.gas_price_cap.is_none()
                 && evm_policy.whitelist_receivers.is_none()
                 && evm_policy.eip1559_pricing.is_none()
@@ -378,6 +380,10 @@ fn default_evm_min_balance() -> u128 {
     DEFAULT_EVM_MIN_BALANCE
 }
 
+fn default_gas_limit_buffer_percent() -> u16 {
+    DEFAULT_GAS_LIMIT_BUFFER_PERCENT
+}
+
 fn default_evm_gas_limit_estimation() -> bool {
     DEFAULT_EVM_GAS_LIMIT_ESTIMATION
 }
@@ -414,6 +420,10 @@ pub struct EvmPolicyResponse {
     #[serde(default = "default_evm_gas_limit_estimation")]
     #[schema(nullable = false)]
     pub gas_limit_estimation: bool,
+    /// Effective gas-estimation headroom in percent.
+    #[serde(default = "default_gas_limit_buffer_percent")]
+    #[schema(minimum = 0, maximum = 200)]
+    pub gas_limit_buffer_percent: u16,
     #[serde(
         skip_serializing_if = "Option::is_none",
         serialize_with = "crate::utils::serialize_optional_u128_as_number",
@@ -515,6 +525,9 @@ impl From<RelayerEvmPolicy> for EvmPolicyResponse {
             gas_limit_estimation: policy
                 .gas_limit_estimation
                 .unwrap_or(DEFAULT_EVM_GAS_LIMIT_ESTIMATION),
+            gas_limit_buffer_percent: policy
+                .gas_limit_buffer_percent
+                .unwrap_or(DEFAULT_GAS_LIMIT_BUFFER_PERCENT),
             gas_price_cap: policy.gas_price_cap,
             whitelist_receivers: policy.whitelist_receivers,
             eip1559_pricing: policy.eip1559_pricing,
@@ -590,6 +603,7 @@ mod tests {
                 private_transactions: None,
                 min_balance: None,
                 gas_limit_estimation: None,
+                gas_limit_buffer_percent: None,
             })),
             "test-signer".to_string(),
             None,
@@ -614,6 +628,7 @@ mod tests {
                     private_transactions: None,
                     min_balance: Some(DEFAULT_EVM_MIN_BALANCE),
                     gas_limit_estimation: Some(DEFAULT_EVM_GAS_LIMIT_ESTIMATION),
+                    gas_limit_buffer_percent: None,
                 }
                 .into()
             ))
@@ -723,6 +738,7 @@ mod tests {
                 private_transactions: None,
                 min_balance: DEFAULT_EVM_MIN_BALANCE,
                 gas_limit_estimation: DEFAULT_EVM_GAS_LIMIT_ESTIMATION,
+                gas_limit_buffer_percent: 10,
             })),
             signer_id: "test-signer".to_string(),
             notification_id: None,
@@ -854,6 +870,7 @@ mod tests {
                 private_transactions: None,
                 min_balance: DEFAULT_EVM_MIN_BALANCE,
                 gas_limit_estimation: DEFAULT_EVM_GAS_LIMIT_ESTIMATION,
+                gas_limit_buffer_percent: 10,
             })),
             signer_id: "test-signer".to_string(),
             notification_id: None,
@@ -1078,6 +1095,7 @@ mod tests {
                 eip1559_pricing: Some(true),
                 min_balance: None, // Some fields can still be None
                 gas_limit_estimation: None,
+                gas_limit_buffer_percent: None,
                 whitelist_receivers: None,
                 private_transactions: None,
             }),

@@ -1113,6 +1113,7 @@ mod tests {
             eip1559_pricing: Some(true),
             private_transactions: Some(false),
             gas_limit_estimation: Some(true),
+            gas_limit_buffer_percent: None,
             whitelist_receivers: Some(vec![
                 "0x1234567890123456789012345678901234567890".to_string()
             ]),
@@ -1170,6 +1171,7 @@ mod tests {
             min_balance: None,
             private_transactions: None,
             gas_limit_estimation: None,
+            gas_limit_buffer_percent: None,
             whitelist_receivers: None,
         }));
 

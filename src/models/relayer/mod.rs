@@ -301,6 +301,10 @@ pub struct RelayerEvmPolicy {
     pub min_balance: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gas_limit_estimation: Option<bool>,
+    /// Extra gas above the RPC estimate, in percent (0..=200). Defaults to 10.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(minimum = 0, maximum = 200)]
+    pub gas_limit_buffer_percent: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(
         serialize_with = "serialize_optional_u128",
@@ -803,8 +807,15 @@ impl Relayer {
             (RelayerNetworkType::Solana, Some(RelayerNetworkPolicy::Solana(policy))) => {
                 self.validate_solana_policy(policy)?;
             }
-            (RelayerNetworkType::Evm, Some(RelayerNetworkPolicy::Evm(_))) => {
-                // EVM policies don't need special validation currently
+            (RelayerNetworkType::Evm, Some(RelayerNetworkPolicy::Evm(policy))) => {
+                if policy
+                    .gas_limit_buffer_percent
+                    .is_some_and(|value| value > 200)
+                {
+                    return Err(RelayerValidationError::InvalidPolicy(
+                        "gas_limit_buffer_percent must be between 0 and 200".into(),
+                    ));
+                }
             }
             (RelayerNetworkType::Stellar, Some(RelayerNetworkPolicy::Stellar(policy))) => {
                 self.validate_stellar_policy(policy)?;
@@ -1671,6 +1682,7 @@ mod tests {
             include_revert_data: None,
             min_balance: Some(1000000000000000000),
             gas_limit_estimation: Some(true),
+            gas_limit_buffer_percent: None,
             gas_price_cap: Some(50000000000),
             whitelist_receivers: Some(vec!["0x123".to_string(), "0x456".to_string()]),
             eip1559_pricing: Some(false),
@@ -2897,6 +2909,7 @@ mod tests {
                 include_revert_data: None,
                 min_balance: Some(1000000000000000000),
                 gas_limit_estimation: Some(true),
+                gas_limit_buffer_percent: None,
                 gas_price_cap: Some(50000000000),
                 whitelist_receivers: None,
                 eip1559_pricing: Some(false),
