@@ -33,8 +33,10 @@ as a live proxy implementation or deploy it as an execution wrapper.
 
 ## Register and call
 
-Requires Node 22.14+ and an RPC supporting archive state and **code overrides on
-both `eth_call` and `eth_estimateGas`**. Validate the actual provider first.
+Requires Node 22.14+ and an RPC supporting recent state at explicit block numbers
+and **code overrides on both `eth_call` and `eth_estimateGas`**. Full archive
+state is needed only for historical validation, not normal live submission.
+Validate the actual provider first.
 
 Install this directory as `/app/plugins/steer-action-plugin` in the relayer image
 or mount it there. Install its runtime dependencies with
