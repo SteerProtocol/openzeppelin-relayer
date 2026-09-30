@@ -1,0 +1,21 @@
+{
+  "plugins": [
+    {
+      "id": "steer-action-gas",
+      "path": "steer-action-plugin/index.ts",
+      "timeout": 120,
+      "allow_get_invocation": false,
+      "config": {
+        "relayerId": "REPLACE_WITH_CONFIGURED_KEEPER_RELAYER_ID",
+        "chainId": "42161",
+        "orchestrator": "0x38a07152ee64c7067feeba904d72abc9a9da0c77",
+        "proxyCodeHash": "REPLACE_WITH_VERIFIED_PROXY_RUNTIME_HASH",
+        "implementationCodeHash": "REPLACE_WITH_VERIFIED_IMPLEMENTATION_RUNTIME_HASH",
+        "maxGas": 1000000,
+        "maxGasPrice": "25000000",
+        "marginBps": 1000,
+        "maxSnapshotAgeSeconds": 60
+      }
+    }
+  ]
+}
