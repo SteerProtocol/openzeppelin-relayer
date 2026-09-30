@@ -462,7 +462,44 @@ where
                 }
             }
         }
+    }?;
+    reconcile_gas_limit_buffers(&config_file, app_state.relayer_repository.as_ref()).await
+}
+
+/// Reconcile explicitly configured gas buffers without resetting Redis state.
+async fn reconcile_gas_limit_buffers<RR>(config: &Config, repository: &RR) -> Result<()>
+where
+    RR: RelayerRepository + Repository<RelayerRepoModel, String>,
+{
+    for configured in &config.relayers {
+        let desired = match &configured.policies {
+            Some(crate::models::ConfigFileRelayerNetworkPolicy::Evm(policy)) => {
+                policy.gas_limit_buffer_percent
+            }
+            _ => None,
+        };
+        let Some(buffer_percent) = desired else {
+            continue;
+        };
+        // Validate before touching persisted state (including the configured range).
+        Relayer::try_from(configured.clone())?;
+        let persisted = repository.get_by_id(configured.id.clone()).await?;
+        let crate::models::RelayerNetworkPolicy::Evm(mut policy) = persisted.policies else {
+            return Err(eyre::eyre!("Configured gas buffer requires an EVM relayer"));
+        };
+        if policy.gas_limit_buffer_percent == Some(buffer_percent) {
+            continue;
+        }
+        policy.gas_limit_buffer_percent = Some(buffer_percent);
+        repository
+            .update_policy(
+                configured.id.clone(),
+                crate::models::RelayerNetworkPolicy::Evm(policy),
+            )
+            .await?;
+        info!(relayer_id = %configured.id, buffer_percent, "reconciled configured gas limit buffer");
     }
+    Ok(())
 }
 
 /// Process config file with distributed locking for Redis storage.
@@ -799,6 +836,102 @@ mod tests {
     use mockito;
     use serde_json::json;
     use std::{sync::Arc, time::Duration};
+
+    #[tokio::test]
+    async fn test_gas_limit_buffer_reconciliation_preserves_state() -> Result<()> {
+        use crate::models::{
+            ConfigFileRelayerNetworkPolicy, RelayerEvmPolicy, RelayerNetworkPolicy,
+        };
+        use crate::repositories::InMemoryRelayerRepository;
+        let mut configured: RelayerFileConfig = serde_json::from_value(serde_json::json!({
+            "id": "arbitrum-node-1", "name": "Arbitrum node 1", "network": "arbitrum",
+            "network_type": "evm", "signer_id": "arbitrum-node-1", "paused": false,
+            "policies": {"gas_limit_buffer_percent": 50}
+        }))?;
+        let repository = InMemoryRelayerRepository::new();
+        let mut persisted = RelayerRepoModel::from(Relayer::try_from(configured.clone())?);
+        persisted.paused = true;
+        persisted.address = "0xf761bb7b92553ea6027045e9aedd6c8d2510fcc0".into();
+        persisted.policies = RelayerNetworkPolicy::Evm(RelayerEvmPolicy {
+            min_balance: Some(123),
+            gas_limit_buffer_percent: None,
+            ..Default::default()
+        });
+        repository.create(persisted.clone()).await?;
+        let mut config = Config {
+            relayers: vec![configured.clone()],
+            signers: vec![],
+            notifications: vec![],
+            networks: NetworksFileConfig::new(vec![])?,
+            plugins: None,
+        };
+        reconcile_gas_limit_buffers(&config, &repository).await?;
+        persisted.policies = RelayerNetworkPolicy::Evm(RelayerEvmPolicy {
+            min_balance: Some(123),
+            gas_limit_buffer_percent: Some(50),
+            ..Default::default()
+        });
+        assert_eq!(
+            serde_json::to_value(repository.get_by_id(configured.id.clone()).await?)?,
+            serde_json::to_value(&persisted)?
+        );
+        // Repeated startup is idempotent; an omitted setting does not erase a stored override.
+        reconcile_gas_limit_buffers(&config, &repository).await?;
+        configured.policies = None;
+        config.relayers = vec![configured.clone()];
+        reconcile_gas_limit_buffers(&config, &repository).await?;
+        assert_eq!(
+            serde_json::to_value(repository.get_by_id(configured.id.clone()).await?)?,
+            serde_json::to_value(&persisted)?
+        );
+        configured.policies = Some(ConfigFileRelayerNetworkPolicy::Evm(serde_json::from_value(
+            serde_json::json!({"gas_limit_buffer_percent": 10}),
+        )?));
+        config.relayers = vec![configured.clone()];
+        reconcile_gas_limit_buffers(&config, &repository).await?;
+        assert_eq!(
+            repository
+                .get_by_id(configured.id)
+                .await?
+                .policies
+                .get_evm_policy()
+                .gas_limit_buffer_percent,
+            Some(10)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_gas_limit_buffer_config_validation_and_response() {
+        for value in [0, 10, 50, 200, 201] {
+            let configured: RelayerFileConfig = serde_json::from_value(serde_json::json!({
+                "id": "arbitrum-node-1", "name": "Arbitrum node 1", "network": "arbitrum",
+                "network_type": "evm", "signer_id": "arbitrum-node-1", "paused": false,
+                "policies": {"gas_limit_buffer_percent": value}
+            }))
+            .unwrap();
+            let result = Relayer::try_from(configured);
+            if value > 200 {
+                assert!(result.is_err());
+                continue;
+            }
+            let response = crate::models::RelayerResponse::from(result.unwrap());
+            assert_eq!(
+                serde_json::to_value(response).unwrap()["policies"]["gas_limit_buffer_percent"],
+                value
+            );
+        }
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("50"),
+        ] {
+            assert!(serde_json::from_value::<crate::models::RelayerEvmPolicy>(
+                serde_json::json!({"gas_limit_buffer_percent":value})
+            )
+            .is_err());
+        }
+    }
 
     fn create_test_app_state() -> AppState<
         MockJobProducerTrait,

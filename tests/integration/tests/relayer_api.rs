@@ -120,6 +120,7 @@ impl CrudTestRelayer {
             RelayerNetworkType::Evm => Some(CreateRelayerPolicyRequest::Evm(RelayerEvmPolicy {
                 min_balance: Some(0),
                 gas_limit_estimation: None,
+                gas_limit_buffer_percent: None,
                 gas_price_cap: None,
                 whitelist_receivers: None,
                 eip1559_pricing: None,

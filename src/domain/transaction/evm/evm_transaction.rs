@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     constants::{
         matches_known_transaction, ALREADY_SUBMITTED_PATTERNS, DEFAULT_EVM_GAS_LIMIT_ESTIMATION,
-        DEFAULT_EVM_STATUS_CHECK_RETRY_DELAY_SECONDS, GAS_LIMIT_BUFFER_MULTIPLIER,
+        DEFAULT_EVM_STATUS_CHECK_RETRY_DELAY_SECONDS, DEFAULT_GAS_LIMIT_BUFFER_PERCENT,
         MAX_NONCE_TOO_HIGH_RETRIES, NONCE_TOO_HIGH_PATTERNS,
     },
     domain::{
@@ -48,6 +48,18 @@ use crate::{
 };
 
 use super::PriceParams;
+
+/// Round up so small estimates never lose their configured headroom.
+fn buffered_gas_limit(estimate: u64, buffer_percent: u16) -> Result<u64, TransactionError> {
+    if estimate == 0 || buffer_percent > 200 {
+        return Err(TransactionError::UnexpectedError(
+            "Invalid gas estimate or buffer percentage".into(),
+        ));
+    }
+    let limit = (u128::from(estimate) * (100 + u128::from(buffer_percent))).div_ceil(100);
+    u64::try_from(limit)
+        .map_err(|_| TransactionError::UnexpectedError("Buffered gas limit exceeds u64".into()))
+}
 
 /// Metadata key that triggers nonce reconciliation in the status checker.
 /// Written by `schedule_nonce_recovery_status_check`, read by `handle_status_impl`.
@@ -622,7 +634,13 @@ where
             TransactionError::UnexpectedError(format!("Failed to estimate gas: {e}"))
         })?;
 
-        Ok(estimated_gas * GAS_LIMIT_BUFFER_MULTIPLIER / 100)
+        let buffer_percent = relayer_policy
+            .gas_limit_buffer_percent
+            .unwrap_or(DEFAULT_GAS_LIMIT_BUFFER_PERCENT);
+        let gas_limit = buffered_gas_limit(estimated_gas, buffer_percent)?;
+        info!(relayer_id = %self.relayer().id, estimated_gas, buffer_percent,
+            gas_limit, "gas limit estimated with configured buffer");
+        Ok(gas_limit)
     }
 }
 
@@ -682,6 +700,9 @@ where
             {
                 Ok(estimated_gas_limit) => {
                     evm_data.gas_limit = Some(estimated_gas_limit);
+                    info!(transaction_id = %tx.id, relayer_id = %tx.relayer_id,
+                        gas_limit = estimated_gas_limit, source = "relayer_estimate",
+                        "transaction gas limit selected");
                 }
                 Err(estimation_error) => {
                     error!(
@@ -700,8 +721,9 @@ where
                         .await;
                 }
             }
-        } else {
-            // do user gas limit validation against block gas limit
+        }
+        {
+            // Validate supplied and estimated limits against the block ceiling.
             let block = self.provider.get_block_by_number().await;
             if let Ok(block) = block {
                 let block_gas_limit = block.header.gas_limit;
@@ -1536,6 +1558,7 @@ mod tests {
             include_revert_data: None,
             min_balance: Some(100000000000000000u128), // 0.1 ETH
             gas_limit_estimation: Some(true),
+            gas_limit_buffer_percent: None,
             gas_price_cap: Some(100000000000), // 100 Gwei
             whitelist_receivers: Some(vec!["0xRecipient".to_string()]),
             eip1559_pricing: Some(false),
@@ -1835,16 +1858,13 @@ mod tests {
             evm_data.gas_limit = None;
         }
 
-        mock_provider
-            .expect_estimate_gas()
-            .times(1)
-            .returning(|_| {
-                Box::pin(async {
-                    Err(crate::services::provider::ProviderError::Other(
-                        "execution reverted".to_string(),
-                    ))
-                })
-            });
+        mock_provider.expect_estimate_gas().times(1).returning(|_| {
+            Box::pin(async {
+                Err(crate::services::provider::ProviderError::Other(
+                    "execution reverted".to_string(),
+                ))
+            })
+        });
 
         let original_tx = test_tx.clone();
         mock_transaction
@@ -1887,12 +1907,99 @@ mod tests {
             signer: mock_signer,
         };
 
-        let prepared = relayer_transaction.prepare_transaction(test_tx).await.unwrap();
+        let prepared = relayer_transaction
+            .prepare_transaction(test_tx)
+            .await
+            .unwrap();
         assert_eq!(prepared.status, TransactionStatus::Failed);
         assert!(prepared
             .status_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("Failed to estimate gas")));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_transaction_rejects_estimated_gas_limit_above_block_ceiling() {
+        let mut mock_transaction = MockTransactionRepository::new();
+        let mock_relayer = MockRelayerRepository::new();
+        let mut mock_provider = MockEvmProviderTrait::new();
+        let mut mock_signer = MockSigner::new();
+        let mut mock_job_producer = MockJobProducerTrait::new();
+        let mock_price_calculator = MockPriceCalculator::new();
+        let mut counter_service = MockTransactionCounterTrait::new();
+        let mock_network = MockNetworkRepository::new();
+
+        let mut test_tx = create_test_transaction();
+        if let NetworkTransactionData::Evm(ref mut evm_data) = test_tx.network_data {
+            evm_data.gas_limit = None;
+        }
+
+        mock_provider
+            .expect_estimate_gas()
+            .times(1)
+            .returning(|_| Box::pin(async { Ok(30_000_000) }));
+        mock_provider
+            .expect_get_block_by_number()
+            .times(1)
+            .returning(|| {
+                Box::pin(async {
+                    use alloy::{network::AnyRpcBlock, rpc::types::Block};
+                    let mut block: Block = Block::default();
+                    block.header.gas_limit = 30_000_000;
+                    Ok(AnyRpcBlock::from(block))
+                })
+            });
+
+        let original_tx = test_tx.clone();
+        mock_transaction
+            .expect_partial_update()
+            .times(1)
+            .withf(|id, update| {
+                id == "test-tx-id"
+                    && update.status == Some(TransactionStatus::Failed)
+                    && update
+                        .status_reason
+                        .as_ref()
+                        .is_some_and(|reason| reason.contains("exceeds block gas limit"))
+            })
+            .returning(move |_, update| {
+                let mut failed_tx = original_tx.clone();
+                failed_tx.status = update.status.unwrap();
+                failed_tx.status_reason = update.status_reason;
+                Ok(failed_tx)
+            });
+
+        counter_service.expect_get_and_increment().times(0);
+        mock_signer.expect_sign_transaction().times(0);
+        mock_job_producer
+            .expect_produce_submit_transaction_job()
+            .times(0);
+        mock_job_producer
+            .expect_produce_send_notification_job()
+            .times(1)
+            .returning(|_, _| Box::pin(ready(Ok(()))));
+
+        let relayer_transaction = EvmRelayerTransaction {
+            relayer: create_test_relayer(),
+            provider: mock_provider,
+            relayer_repository: Arc::new(mock_relayer),
+            network_repository: Arc::new(mock_network),
+            transaction_repository: Arc::new(mock_transaction),
+            transaction_counter_service: Arc::new(counter_service),
+            job_producer: Arc::new(mock_job_producer),
+            price_calculator: mock_price_calculator,
+            signer: mock_signer,
+        };
+
+        let prepared = relayer_transaction
+            .prepare_transaction(test_tx)
+            .await
+            .unwrap();
+        assert_eq!(prepared.status, TransactionStatus::Failed);
+        assert!(prepared
+            .status_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("exceeds block gas limit")));
     }
 
     #[tokio::test]
@@ -1907,6 +2014,7 @@ mod tests {
 
         let relayer = create_test_relayer_with_policy(RelayerEvmPolicy {
             gas_limit_estimation: Some(false),
+            gas_limit_buffer_percent: None,
             min_balance: Some(100000000000000000u128),
             ..Default::default()
         });
@@ -2032,6 +2140,7 @@ mod tests {
 
         let relayer = create_test_relayer_with_policy(RelayerEvmPolicy {
             gas_limit_estimation: Some(false), // User provides gas limit
+            gas_limit_buffer_percent: None,
             min_balance: Some(100000000000000000u128),
             ..Default::default()
         });
@@ -2153,6 +2262,7 @@ mod tests {
 
         let relayer = create_test_relayer_with_policy(RelayerEvmPolicy {
             gas_limit_estimation: Some(false), // User provides gas limit
+            gas_limit_buffer_percent: None,
             min_balance: Some(100000000000000000u128),
             ..Default::default()
         });
@@ -2732,6 +2842,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_gas_limit_buffer_rounding_and_bounds() {
+        assert_eq!(buffered_gas_limit(459_767, 50).unwrap(), 689_651);
+        assert_eq!(buffered_gas_limit(459_767, 10).unwrap(), 505_744);
+        assert_eq!(buffered_gas_limit(21_000, 10).unwrap(), 23_100);
+        assert_eq!(buffered_gas_limit(21_001, 50).unwrap(), 31_502);
+        assert_eq!(buffered_gas_limit(21_001, 0).unwrap(), 21_001);
+        assert_eq!(buffered_gas_limit(1, 200).unwrap(), 3);
+        assert!(buffered_gas_limit(0, 50).is_err());
+        assert!(buffered_gas_limit(21_000, 201).is_err());
+        assert!(buffered_gas_limit(u64::MAX, 50).is_err());
+    }
+
     #[tokio::test]
     async fn test_estimate_tx_gas_limit_success() {
         let mock_transaction = MockTransactionRepository::new();
@@ -2746,6 +2869,7 @@ mod tests {
         // Create test relayer and pending transaction
         let relayer = create_test_relayer_with_policy(RelayerEvmPolicy {
             gas_limit_estimation: Some(true),
+            gas_limit_buffer_percent: None,
             ..Default::default()
         });
         let evm_data = EvmTransactionData {
@@ -2807,6 +2931,7 @@ mod tests {
         // Create test relayer and pending transaction
         let relayer = create_test_relayer_with_policy(RelayerEvmPolicy {
             gas_limit_estimation: Some(false),
+            gas_limit_buffer_percent: None,
             ..Default::default()
         });
 
@@ -2867,6 +2992,7 @@ mod tests {
 
         let relayer = create_test_relayer_with_policy(RelayerEvmPolicy {
             gas_limit_estimation: None, // Should default to true
+            gas_limit_buffer_percent: None,
             ..Default::default()
         });
 
@@ -2928,6 +3054,7 @@ mod tests {
 
         let relayer = create_test_relayer_with_policy(RelayerEvmPolicy {
             gas_limit_estimation: Some(true),
+            gas_limit_buffer_percent: None,
             ..Default::default()
         });
 
@@ -2995,6 +3122,7 @@ mod tests {
         // Create test relayer with gas limit estimation enabled
         let relayer = create_test_relayer_with_policy(RelayerEvmPolicy {
             gas_limit_estimation: Some(true),
+            gas_limit_buffer_percent: None,
             min_balance: Some(100000000000000000u128),
             ..Default::default()
         });
@@ -3015,6 +3143,14 @@ mod tests {
             .expect_estimate_gas()
             .times(1)
             .returning(move |_| Box::pin(async move { Ok(PROVIDER_GAS_ESTIMATE) }));
+
+        mock_provider.expect_get_block_by_number().returning(|| {
+            Box::pin(async {
+                Err(crate::services::provider::ProviderError::Other(
+                    "Block query unavailable in this fixture".into(),
+                ))
+            })
+        });
 
         // Mock provider for balance check
         mock_provider
@@ -3144,6 +3280,7 @@ mod tests {
 
         let relayer = create_test_relayer_with_policy(RelayerEvmPolicy {
             gas_limit_estimation: Some(true),
+            gas_limit_buffer_percent: None,
             min_balance: Some(100000000000000000u128),
             ..Default::default()
         });
@@ -3239,6 +3376,14 @@ mod tests {
 
                 Ok(updated_tx)
             });
+
+        mock_provider.expect_get_block_by_number().returning(|| {
+            Box::pin(async {
+                Err(crate::services::provider::ProviderError::Other(
+                    "Block query unavailable in this fixture".into(),
+                ))
+            })
+        });
 
         let transaction = EvmRelayerTransaction::new(
             relayer,

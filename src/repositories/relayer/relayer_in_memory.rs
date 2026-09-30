@@ -289,6 +289,7 @@ mod tests {
                 private_transactions: Some(false),
                 min_balance: Some(0),
                 gas_limit_estimation: Some(true),
+                gas_limit_buffer_percent: None,
             }),
             signer_id: "test".to_string(),
             address: "0x".to_string(),
@@ -472,6 +473,7 @@ mod tests {
             private_transactions: Some(true),
             min_balance: Some(1000000),
             gas_limit_estimation: Some(true),
+            gas_limit_buffer_percent: None,
         });
 
         // Update the policy

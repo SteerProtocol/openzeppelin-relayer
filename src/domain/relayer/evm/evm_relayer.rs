@@ -839,6 +839,7 @@ mod tests {
                 eip1559_pricing: Some(true),
                 private_transactions: Some(false),
                 gas_limit_estimation: Some(true),
+                gas_limit_buffer_percent: None,
             }),
             network_type: NetworkType::Evm,
             custom_rpc_urls: None,
