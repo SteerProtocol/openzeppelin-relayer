@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ExecutionReverted } from "../errors";
 import { data, mockRpc, policy } from "./helpers";
+const { relayerId, chainId, ...policySettings } = policy;
 // Load the repository's actual compiler and pooled executor, not a replica.
 const { compilePlugin } = require("../../../plugins/lib/compiler") as {
   compilePlugin: (
@@ -94,10 +95,14 @@ test("actual pooled runtime bundles and invokes plugin over its relayer socket p
       taskId: "steer-runtime-test",
       pluginId: "steer-action",
       compiledCode: compiled.code,
-      params: { data, mode: "submit" },
+      params: { data, mode: "submit", relayerId: "keeper" },
       socketPath,
       timeout: 10000,
-      config: policy,
+      config: {
+        chains: {
+          [policy.chainId]: { ...policySettings, relayerIds: ["keeper"] },
+        },
+      },
       method: "POST",
     });
     assert.equal(result.success, true, JSON.stringify(result.error));

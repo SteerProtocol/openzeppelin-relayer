@@ -3,6 +3,7 @@ import { test } from "node:test";
 import type { PluginContext } from "@openzeppelin/relayer-sdk";
 import { handler, relayerRpc, withinDeadline } from "../index";
 import { data, mockRpc, policy } from "./helpers";
+const { relayerId, chainId, ...policySettings } = policy;
 
 function context(
   mode = "estimate",
@@ -28,8 +29,12 @@ function context(
   };
   const ctx = {
     method: "POST",
-    config: policy,
-    params: { data, mode },
+    config: {
+      chains: {
+        [policy.chainId]: { ...policySettings, relayerIds: ["keeper"] },
+      },
+    },
+    params: { data, mode, relayerId: "keeper" },
     api: {
       useRelayer: (id: string) => {
         assert.equal(id, "keeper");
@@ -141,7 +146,15 @@ test("validation deadline rejects hung reads and prevents later continuation", a
 
 test("disabled submission and changed relayer fee cap never enqueue", async () => {
   const disabled = context("submit");
-  disabled.ctx.config = { ...policy, submitEnabled: false };
+  disabled.ctx.config = {
+    chains: {
+      [policy.chainId]: {
+        ...policySettings,
+        relayerIds: ["keeper"],
+        submitEnabled: false,
+      },
+    },
+  };
   await assert.rejects(handler(disabled.ctx), /disabled/);
   assert.equal(disabled.sent.length, 0);
   const capped = context("submit");
@@ -154,4 +167,42 @@ test("disabled submission and changed relayer fee cap never enqueue", async () =
   });
   await assert.rejects(handler(capped.ctx), /cap/);
   assert.equal(capped.sent.length, 0);
+});
+
+test("wrong RPC chain aborts before enqueue", async () => {
+  const c = context("submit", (method) =>
+    method === "eth_chainId" ? "0x2105" : undefined,
+  );
+  await assert.rejects(handler(c.ctx));
+  assert.equal(c.sent.length, 0);
+});
+test("concurrent requests retain independent relayer selection and submit flags", async () => {
+  const first = context("submit");
+  const second = context("submit");
+  second.ctx.params = { data, mode: "submit", relayerId: "other" };
+  second.ctx.config = {
+    chains: {
+      [policy.chainId]: {
+        ...policySettings,
+        submitEnabled: false,
+        relayerIds: ["other"],
+      },
+    },
+  };
+  second.ctx.api.useRelayer = (() =>
+    second.relayer) as unknown as typeof second.ctx.api.useRelayer;
+  second.relayer.getRelayer = async () => ({
+    id: "other",
+    network_type: "evm",
+    address: "0x1000000000000000000000000000000000000001",
+    paused: false,
+  });
+  const results = await Promise.allSettled([
+    handler(first.ctx),
+    handler(second.ctx),
+  ]);
+  assert.equal(results[0].status, "fulfilled");
+  assert.equal(results[1].status, "rejected");
+  assert.equal(first.sent.length, 1);
+  assert.equal(second.sent.length, 0);
 });

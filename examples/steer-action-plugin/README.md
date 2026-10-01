@@ -25,7 +25,7 @@ Configuration separates:
 - `profile`: reviewed ID, backend, proxy/implementation hashes. Addresses default to the
   SDK. Optional `profile.deployments` overrides are for reviewed alternate deployments
   and isolated fixtures, never request parameters.
-- Operator policy: `relayerId`, expected `chainId`, required `maxGas` outer ceiling and
+- Operator policy: approved `relayerIds`, chain-map key `chainId`, required `maxGas` outer ceiling and
   `maxGasPrice` fee ceiling in wei, margin, freshness and deadline.
 - `estimateEnabled` and `submitEnabled`: both default false. Submission requires both true.
 
@@ -76,10 +76,10 @@ and normal chain/block/code/storage/account/fee reads. `guarded-rpc` additionall
 overrides on `eth_estimateGas`. Archive state is needed only for historical replay.
 
 Install this directory in the relayer image, install its runtime dependencies with
-`npm ci --omit=dev --ignore-scripts`, and register a separate policy for each keeper.
+`npm ci --omit=dev --ignore-scripts`, and register the shared plugin with one policy per chain.
 The fragment deliberately requires verified code hashes and an operator fee cap.
-Use plugin IDs `steer-action-<relayerId>`, such as `steer-action-arbitrum-node-1`.
-Old configuration with top-level `orchestrator`/hashes must be migrated to `profile`.
+Register one `steer-action` plugin. Its `config.chains` map is keyed by numeric chain ID. Each entry contains one chain policy and a `relayerIds` allowlist for its keepers. A relayer may appear in only one chain entry. Requests select an approved relayer; the actual RPC chain ID must match its configured chain. Each chain retains independent estimate/submit switches.
+Existing per-keeper registrations must migrate to `config.chains` and the shared endpoint; the old request envelope is rejected.
 No new chain is automatically enabled by its presence in the SDK.
 
 Keep runner timeout at 120 seconds or more; the shared read deadline defaults to 30 seconds
@@ -88,11 +88,11 @@ configure `deadlineMs` at most 20,000 and verify end-to-end timing. Timed-out re
 later continue into enqueue. Submission itself can have an ambiguous transport outcome.
 
 ```http
-POST /api/v1/plugins/steer-action-arbitrum-node-1/call
+POST /api/v1/plugins/steer-action/call
 Content-Type: application/json
 Authorization: Bearer <existing relayer credential>
 
-{"params":{"mode":"estimate","data":"0x<encoded executeAction>"}}
+{"params":{"relayerId":"arbitrum-node-1","mode":"estimate","data":"0x<encoded executeAction>"}}
 ```
 
 Use authenticated POST and the standard response envelope (`raw_response: false`). Submit
@@ -163,3 +163,9 @@ result; increasing gas does not repair an invalid swap. Archive availability is 
   response must be reconciled before another attempt. Retain transaction IDs and action records.
 - The SDK is a pinned dependency with a broad transitive dependency tree. Review dependency
   audit findings when updating it; do not run automatic breaking dependency fixes in this PR.
+
+## Organization and caller authorization
+
+`config.ts` resolves the trusted chain policy and approved keeper. `types.ts` holds shared execution types. `validation.ts` holds input validators. `index.ts` orchestrates one request; `metadata.ts` and `gas.ts` remain the single metadata and simulation implementations. No mutable simulation state is shared across invocations.
+
+A shared endpoint changes IAM route granularity: permission to call it reaches every configured keeper unless the authenticated gateway enforces a caller-to-relayer allowlist. The plugin context does not provide an authenticated IAM principal. The chain map is an operator allowlist, not caller authorization. Before rollout, either verify that callers are authorized for every configured keeper, or enforce the authenticated principal's permitted `params.relayerId` at the trusted proxy. Never derive that principal from request body fields. Route-level IAM alone cannot preserve previous per-keeper isolation on a shared route.

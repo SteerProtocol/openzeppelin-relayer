@@ -5,7 +5,15 @@ import {
 import { Interface, getAddress, type InterfaceAbi } from "ethers";
 import orchestratorAbi from "./orchestrator-abi.json";
 import { ActionError } from "./errors";
-import type { Policy, Rpc, Snapshot, Transaction } from "./gas";
+import type {
+  Policy,
+  Rpc,
+  Snapshot,
+  Transaction,
+  ContractName,
+  Deployments,
+  ActionMetadata,
+} from "./types";
 
 export const SDK_VERSION = "3.8.0";
 export const ACTION_ABI = new Interface(orchestratorAbi);
@@ -17,18 +25,7 @@ export const CORE_ABIS = {
     abis.StrategyRegistry as unknown as InterfaceAbi,
   ),
 };
-export type ContractName = keyof typeof CORE_ABIS;
-export type Deployments = Record<ContractName, string>;
-export interface ActionMetadata {
-  deployments: Deployments;
-  target: string;
-  strategyId: string;
-  vaultState: number;
-  innerGasAllowance: string;
-  strategyGasPriceCap: string;
-  effectiveGasPriceCap: string;
-  gasBalance: string;
-}
+export type { ContractName, Deployments, ActionMetadata } from "./types";
 export function deploymentsFor(policy: Policy): Deployments {
   const chainId = Number(policy.chainId);
   if (!Number.isSafeInteger(chainId))

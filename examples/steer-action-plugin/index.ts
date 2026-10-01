@@ -1,3 +1,4 @@
+import { parseRequest, resolvePolicy } from "./config";
 import {
   ActionError,
   ExecutionReverted,
@@ -8,7 +9,6 @@ import type { PluginContext, Relayer } from "@openzeppelin/relayer-sdk";
 import {
   estimateAction,
   parseAction,
-  parsePolicy,
   readSnapshot,
   requireFresh,
   verifyBeforeSubmission,
@@ -46,8 +46,9 @@ export function relayerRpc(
 /** Explicit endpoint, not a relayer lifecycle hook. POST only, fail closed. */
 export async function handler(context: PluginContext) {
   if (context.method !== "POST") throw new Error("Only POST is accepted");
-  const policy = parsePolicy(context.config);
-  const action = parseAction(context.params);
+  const request = parseRequest(context.params);
+  const policy = resolvePolicy(context.config, request.relayerId);
+  const action = parseAction(request.action);
   const relayer = context.api.useRelayer(policy.relayerId);
   // Finish validation before the configured 120-second runner timeout. A timed
   // out read cannot later continue into an enqueue operation.

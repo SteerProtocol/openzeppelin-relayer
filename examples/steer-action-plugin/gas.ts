@@ -1,173 +1,39 @@
 import { getAddress, keccak256, toQuantity } from "ethers";
 import guard from "./guard-runtime.json";
 
-export type Rpc = (method: string, params: unknown[]) => Promise<unknown>;
+import type {
+  Rpc,
+  Policy,
+  Action,
+  Snapshot,
+  Transaction,
+  GasReport,
+} from "./types";
+export type {
+  Rpc,
+  Policy,
+  Action,
+  Snapshot,
+  Transaction,
+  GasReport,
+  CompatibilityProfile,
+} from "./types";
+import { parsePolicy } from "./config";
+export { parsePolicy } from "./config";
+import { record, decimal, hash, address, CODE_COPY } from "./validation";
+export { CODE_COPY } from "./validation";
 export { ACTION_ABI } from "./metadata";
 import {
   ACTION_ABI,
   deploymentsFor,
   readActionMetadata,
   SDK_VERSION,
-  type Deployments,
-  type ActionMetadata,
 } from "./metadata";
 import { ActionError, ExecutionReverted, withinDeadline } from "./errors";
-export const CODE_COPY = "0x00000000000000000000000000000000Ac710001";
+
 const IMPLEMENTATION_SLOT =
   "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
 
-export interface CompatibilityProfile {
-  id: string;
-  backend: "guarded-rpc" | "native-call-search";
-  proxyCodeHash: string;
-  implementationCodeHash: string;
-  // Reviewed alternate deployments only; callers cannot provide these.
-  deployments?: Partial<Deployments>;
-}
-export interface Policy {
-  relayerId: string;
-  chainId: string;
-  profile: CompatibilityProfile;
-  estimateEnabled: boolean;
-  submitEnabled: boolean;
-  deadlineMs: number;
-  maxGas: number;
-  maxGasPrice: string;
-  marginBps: number;
-  maxSnapshotAgeSeconds: number;
-}
-export interface Action {
-  data: string;
-  mode: "estimate" | "submit";
-}
-export interface Snapshot {
-  number: string;
-  hash: string;
-  gasLimit: string;
-  timestamp: string;
-}
-export interface Transaction {
-  from: string;
-  to: string;
-  data: string;
-  value: string;
-  gasPrice: string;
-}
-export interface GasReport {
-  chainId: string;
-  profileId: string;
-  backend: CompatibilityProfile["backend"];
-  sdkVersion: string;
-  metadata: ActionMetadata;
-  relayerFeeCap?: string;
-  snapshot: Snapshot;
-  implementation: string;
-  guardedEstimate: number;
-  gasLimit: number;
-  gasPrice: string;
-  transaction: Transaction;
-}
-
-function record(value: unknown, name: string): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value))
-    throw new Error(`Invalid ${name}`);
-  return value as Record<string, unknown>;
-}
-function integer(
-  value: unknown,
-  name: string,
-  min: number,
-  max: number,
-): number {
-  if (
-    !Number.isSafeInteger(value) ||
-    (value as number) < min ||
-    (value as number) > max
-  )
-    throw new Error(`Invalid ${name}`);
-  return value as number;
-}
-function decimal(value: unknown, name: string): string {
-  if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value))
-    throw new Error(`Invalid ${name}: positive decimal string required`);
-  return value;
-}
-function hash(value: unknown, name: string): string {
-  if (typeof value !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(value))
-    throw new Error(`Invalid ${name}`);
-  return value.toLowerCase();
-}
-function address(value: unknown, name: string): string {
-  if (typeof value !== "string") throw new Error(`Invalid ${name}`);
-  const result = getAddress(value);
-  if (BigInt(result) === 0n || result === CODE_COPY)
-    throw new Error(`Reserved ${name}`);
-  return result;
-}
-export function parsePolicy(value: unknown): Policy {
-  const p = record(value, "deployment configuration");
-  if (typeof p.relayerId !== "string" || !p.relayerId.trim())
-    throw new Error("Invalid relayerId");
-  const maxGasPrice = decimal(p.maxGasPrice, "maxGasPrice");
-  if (BigInt(maxGasPrice) > BigInt(Number.MAX_SAFE_INTEGER))
-    throw new Error("maxGasPrice exceeds SDK numeric precision");
-  const profile = record(p.profile, "compatibility profile");
-  if (typeof profile.id !== "string" || !/^[a-zA-Z0-9_-]+$/.test(profile.id))
-    throw new Error("Invalid profile id");
-  if (
-    profile.backend !== "guarded-rpc" &&
-    profile.backend !== "native-call-search"
-  )
-    throw new Error("Invalid estimation backend");
-  for (const flag of ["estimateEnabled", "submitEnabled"])
-    if (p[flag] !== undefined && typeof p[flag] !== "boolean")
-      throw new Error(`Invalid ${flag}`);
-  if (p.submitEnabled && !p.estimateEnabled)
-    throw new Error("Submission requires enabled estimation");
-  const deployments: Partial<Deployments> = {};
-  if (profile.deployments !== undefined) {
-    for (const [name, value] of Object.entries(
-      record(profile.deployments, "deployment overrides"),
-    )) {
-      if (
-        ![
-          "Orchestrator",
-          "GasVault",
-          "VaultRegistry",
-          "StrategyRegistry",
-        ].includes(name)
-      )
-        throw new Error("Unknown deployment override");
-      deployments[name as keyof Deployments] = address(value, name);
-    }
-  }
-  return {
-    relayerId: p.relayerId,
-    chainId: decimal(p.chainId, "chainId"),
-    profile: {
-      id: profile.id,
-      backend: profile.backend,
-      proxyCodeHash: hash(profile.proxyCodeHash, "proxyCodeHash"),
-      implementationCodeHash: hash(
-        profile.implementationCodeHash,
-        "implementationCodeHash",
-      ),
-      ...(Object.keys(deployments).length ? { deployments } : {}),
-    },
-    estimateEnabled: p.estimateEnabled === true,
-    submitEnabled: p.submitEnabled === true,
-    deadlineMs: integer(p.deadlineMs ?? 30000, "deadlineMs", 1000, 90000),
-    maxGas: integer(p.maxGas, "maxGas", 21000, 100_000_000),
-    maxGasPrice,
-    marginBps: integer(p.marginBps ?? 1000, "marginBps", 0, 10000),
-    maxSnapshotAgeSeconds: integer(
-      p.maxSnapshotAgeSeconds ?? 60,
-      "maxSnapshotAgeSeconds",
-      1,
-      300,
-    ),
-  };
-}
 export function parseAction(value: unknown): Action {
   const p = record(value, "action");
   if (Object.keys(p).some((k) => k !== "data" && k !== "mode"))
