@@ -1,20 +1,36 @@
-import { Interface, getAddress, keccak256, toQuantity } from "ethers";
+import { getAddress, keccak256, toQuantity } from "ethers";
 import guard from "./guard-runtime.json";
 
 export type Rpc = (method: string, params: unknown[]) => Promise<unknown>;
-export const ACTION_ABI = new Interface([
-  "function executeAction(address targetAddress,uint256 jobEpoch,bytes[] calldatas,uint256[] timeIndependentLengths,bytes32 jobHash) returns (uint8)",
-]);
+export { ACTION_ABI } from "./metadata";
+import {
+  ACTION_ABI,
+  deploymentsFor,
+  readActionMetadata,
+  SDK_VERSION,
+  type Deployments,
+  type ActionMetadata,
+} from "./metadata";
+import { ActionError, ExecutionReverted, withinDeadline } from "./errors";
 export const CODE_COPY = "0x00000000000000000000000000000000Ac710001";
 const IMPLEMENTATION_SLOT =
   "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
 
+export interface CompatibilityProfile {
+  id: string;
+  backend: "guarded-rpc" | "native-call-search";
+  proxyCodeHash: string;
+  implementationCodeHash: string;
+  // Reviewed alternate deployments only; callers cannot provide these.
+  deployments?: Partial<Deployments>;
+}
 export interface Policy {
   relayerId: string;
   chainId: string;
-  orchestrator: string;
-  proxyCodeHash: string;
-  implementationCodeHash: string;
+  profile: CompatibilityProfile;
+  estimateEnabled: boolean;
+  submitEnabled: boolean;
+  deadlineMs: number;
   maxGas: number;
   maxGasPrice: string;
   marginBps: number;
@@ -39,6 +55,11 @@ export interface Transaction {
 }
 export interface GasReport {
   chainId: string;
+  profileId: string;
+  backend: CompatibilityProfile["backend"];
+  sdkVersion: string;
+  metadata: ActionMetadata;
+  relayerFeeCap?: string;
   snapshot: Snapshot;
   implementation: string;
   guardedEstimate: number;
@@ -90,15 +111,52 @@ export function parsePolicy(value: unknown): Policy {
   const maxGasPrice = decimal(p.maxGasPrice, "maxGasPrice");
   if (BigInt(maxGasPrice) > BigInt(Number.MAX_SAFE_INTEGER))
     throw new Error("maxGasPrice exceeds SDK numeric precision");
+  const profile = record(p.profile, "compatibility profile");
+  if (typeof profile.id !== "string" || !/^[a-zA-Z0-9_-]+$/.test(profile.id))
+    throw new Error("Invalid profile id");
+  if (
+    profile.backend !== "guarded-rpc" &&
+    profile.backend !== "native-call-search"
+  )
+    throw new Error("Invalid estimation backend");
+  for (const flag of ["estimateEnabled", "submitEnabled"])
+    if (p[flag] !== undefined && typeof p[flag] !== "boolean")
+      throw new Error(`Invalid ${flag}`);
+  if (p.submitEnabled && !p.estimateEnabled)
+    throw new Error("Submission requires enabled estimation");
+  const deployments: Partial<Deployments> = {};
+  if (profile.deployments !== undefined) {
+    for (const [name, value] of Object.entries(
+      record(profile.deployments, "deployment overrides"),
+    )) {
+      if (
+        ![
+          "Orchestrator",
+          "GasVault",
+          "VaultRegistry",
+          "StrategyRegistry",
+        ].includes(name)
+      )
+        throw new Error("Unknown deployment override");
+      deployments[name as keyof Deployments] = address(value, name);
+    }
+  }
   return {
     relayerId: p.relayerId,
     chainId: decimal(p.chainId, "chainId"),
-    orchestrator: address(p.orchestrator, "orchestrator"),
-    proxyCodeHash: hash(p.proxyCodeHash, "proxyCodeHash"),
-    implementationCodeHash: hash(
-      p.implementationCodeHash,
-      "implementationCodeHash",
-    ),
+    profile: {
+      id: profile.id,
+      backend: profile.backend,
+      proxyCodeHash: hash(profile.proxyCodeHash, "proxyCodeHash"),
+      implementationCodeHash: hash(
+        profile.implementationCodeHash,
+        "implementationCodeHash",
+      ),
+      ...(Object.keys(deployments).length ? { deployments } : {}),
+    },
+    estimateEnabled: p.estimateEnabled === true,
+    submitEnabled: p.submitEnabled === true,
+    deadlineMs: integer(p.deadlineMs ?? 30000, "deadlineMs", 1000, 90000),
     maxGas: integer(p.maxGas, "maxGas", 21000, 100_000_000),
     maxGasPrice,
     marginBps: integer(p.marginBps ?? 1000, "marginBps", 0, 10000),
@@ -127,8 +185,7 @@ export function parseAction(value: unknown): Action {
   const decoded = ACTION_ABI.parseTransaction({ data: p.data });
   if (!decoded || decoded.name !== "executeAction")
     throw new Error("Only executeAction is accepted");
-  if (getAddress(decoded.args.targetAddress) === CODE_COPY)
-    throw new Error("Reserved action target");
+  address(decoded.args.targetAddress, "action target");
   // Reject trailing bytes and noncanonical encodings, keeping the checked payload exact.
   if (
     ACTION_ABI.encodeFunctionData(
@@ -163,7 +220,10 @@ export function requireFresh(snapshot: Snapshot, policy: Policy): void {
   const age =
     Math.floor(Date.now() / 1000) - Number(BigInt(snapshot.timestamp));
   if (age < -30 || age > policy.maxSnapshotAgeSeconds)
-    throw new Error("RPC snapshot is stale or has a future timestamp");
+    throw new ActionError(
+      "STALE_SNAPSHOT",
+      "RPC snapshot is stale or has a future timestamp",
+    );
 }
 async function code(rpc: Rpc, at: string, tag: string): Promise<string> {
   const result = await rpc("eth_getCode", [at, tag]);
@@ -180,25 +240,35 @@ export async function checkDeployment(
     quantity(await rpc("eth_chainId", []), "chain ID") !==
     BigInt(policy.chainId)
   )
-    throw new Error("RPC chain ID mismatch");
-  const proxyCode = await code(rpc, policy.orchestrator, snapshot.number);
-  if (keccak256(proxyCode) !== policy.proxyCodeHash)
-    throw new Error("Proxy runtime code hash mismatch");
+    throw new ActionError("CHAIN_MISMATCH", "RPC chain ID mismatch");
+  const proxyCode = await code(
+    rpc,
+    deploymentsFor(policy).Orchestrator,
+    snapshot.number,
+  );
+  if (keccak256(proxyCode) !== policy.profile.proxyCodeHash)
+    throw new ActionError(
+      "DEPLOYMENT_CHANGED",
+      "Proxy runtime code hash mismatch",
+    );
   const slot = await rpc("eth_getStorageAt", [
-    policy.orchestrator,
+    deploymentsFor(policy).Orchestrator,
     IMPLEMENTATION_SLOT,
     snapshot.number,
   ]);
   if (typeof slot !== "string" || !/^0x0{24}[0-9a-fA-F]{40}$/.test(slot))
     throw new Error("Invalid EIP-1967 implementation slot");
   const implementation = address("0x" + slot.slice(-40), "implementation");
-  if (implementation === policy.orchestrator)
+  if (implementation === deploymentsFor(policy).Orchestrator)
     throw new Error("Implementation cannot equal proxy");
   if (
     keccak256(await code(rpc, implementation, snapshot.number)) !==
-    policy.implementationCodeHash
+    policy.profile.implementationCodeHash
   )
-    throw new Error("Implementation runtime code hash mismatch");
+    throw new ActionError(
+      "DEPLOYMENT_CHANGED",
+      "Implementation runtime code hash mismatch",
+    );
   return { proxyCode, implementation };
 }
 export function requireCompleted(result: unknown): void {
@@ -207,26 +277,49 @@ export function requireCompleted(result: unknown): void {
     !/^0x[0-9a-fA-F]{64}$/.test(result) ||
     BigInt(result) !== 1n
   )
-    throw new Error("Original transaction did not return COMPLETED");
+    throw new ActionError(
+      "ACTION_NOT_COMPLETED",
+      "Original transaction did not return COMPLETED",
+    );
 }
 async function checkCanonical(rpc: Rpc, snapshot: Snapshot): Promise<void> {
   if ((await readSnapshot(rpc, snapshot.number)).hash !== snapshot.hash)
-    throw new Error("Snapshot block changed during validation");
+    throw new ActionError(
+      "SNAPSHOT_CHANGED",
+      "Snapshot block changed during validation",
+    );
 }
 export async function estimateAction(
   rpc: Rpc,
   policy: Policy,
   action: Action,
   sender: string,
-  options: { blockTag?: string; gasPrice?: string } = {},
+  options: {
+    blockTag?: string;
+    gasPrice?: string;
+    relayerFeeCap?: string;
+  } = {},
 ): Promise<GasReport> {
   // Revalidate even when called directly by the read-only validation script.
   policy = parsePolicy(policy);
   action = parseAction(action);
+  const upstream = rpc;
+  const deadline = Date.now() + policy.deadlineMs;
+  rpc = (method, params) =>
+    withinDeadline(() => upstream(method, params), deadline);
+  if (
+    !policy.estimateEnabled ||
+    (action.mode === "submit" && !policy.submitEnabled)
+  )
+    throw new ActionError(
+      "CHAIN_DISABLED",
+      "Requested action mode is disabled for this profile",
+    );
   const from = address(sender, "keeper");
-  if (from === policy.orchestrator)
+  if (from === deploymentsFor(policy).Orchestrator)
     throw new Error("Keeper cannot equal Orchestrator");
   const snapshot = await readSnapshot(rpc, options.blockTag);
+  if (options.blockTag === undefined) requireFresh(snapshot, policy);
   const { proxyCode, implementation } = await checkDeployment(
     rpc,
     policy,
@@ -259,64 +352,153 @@ export async function estimateAction(
       : BigInt(snapshot.gasLimit);
   const transaction: Transaction = {
     from,
-    to: policy.orchestrator,
+    to: deploymentsFor(policy).Orchestrator,
     data: action.data,
     value: "0x0",
     gasPrice: toQuantity(gasPrice),
   };
+  const metadata = await readActionMetadata(
+    rpc,
+    policy,
+    snapshot,
+    transaction,
+    options.relayerFeeCap,
+  );
   const overrides = {
-    [policy.orchestrator]: { code: guard.runtime },
+    [deploymentsFor(policy).Orchestrator]: { code: guard.runtime },
     [CODE_COPY]: { code: proxyCode },
   };
   const bounded = { ...transaction, gas: toQuantity(ceiling) };
-  // Establish a successful upper bound first. Unsupported overrides and permanent
-  // action failures stop here; never silently fall back to the ordinary estimator.
-  requireCompleted(
-    await rpc("eth_call", [bounded, snapshot.number, overrides]),
-  );
-  const estimate = quantity(
-    await rpc("eth_estimateGas", [bounded, snapshot.number, overrides]),
-    "gas estimate",
-  );
-  const gas = (estimate * BigInt(10000 + policy.marginBps) + 9999n) / 10000n;
-  if (estimate < 21000n || gas > ceiling)
-    throw new Error(
-      "Guarded estimate plus margin exceeds configured/block gas cap",
+  // A successful action alone cannot prove an endpoint honored code overrides.
+  // Force an empty return, then require estimation to respect a forced revert.
+  const empty = await rpc("eth_call", [
+    bounded,
+    snapshot.number,
+    { [transaction.to]: { code: "0x60006000f3" } },
+  ]);
+  if (empty !== "0x")
+    throw new ActionError(
+      "UNSUPPORTED_OVERRIDES",
+      "RPC ignored eth_call code override",
     );
-  requireCompleted(
-    await rpc("eth_call", [
-      { ...transaction, gas: toQuantity(estimate) },
-      snapshot.number,
-      overrides,
-    ]),
-  );
-  requireCompleted(
-    await rpc("eth_call", [
-      { ...transaction, gas: toQuantity(gas) },
-      snapshot.number,
-    ]),
-  );
-  await checkCanonical(rpc, snapshot);
-  return {
-    chainId: policy.chainId,
-    snapshot,
-    implementation,
-    guardedEstimate: Number(estimate),
-    gasLimit: Number(gas),
-    gasPrice: gasPrice.toString(),
-    transaction,
-  };
+  if (policy.profile.backend === "guarded-rpc") {
+    try {
+      await rpc("eth_estimateGas", [
+        bounded,
+        snapshot.number,
+        { [transaction.to]: { code: "0x60006000fd" } },
+      ]);
+    } catch (error) {
+      if (!(error instanceof ExecutionReverted)) throw error;
+      // Only a proven execution revert demonstrates this capability.
+      return finish(await guardedEstimate());
+    }
+    throw new ActionError(
+      "UNSUPPORTED_OVERRIDES",
+      "RPC ignored eth_estimateGas code override",
+    );
+  }
+  return finish(await searchEstimate());
+
+  async function guardedEstimate(): Promise<bigint> {
+    requireCompleted(
+      await rpc("eth_call", [bounded, snapshot.number, overrides]),
+    );
+    return quantity(
+      await rpc("eth_estimateGas", [bounded, snapshot.number, overrides]),
+      "gas estimate",
+    );
+  }
+  async function searchEstimate(): Promise<bigint> {
+    requireCompleted(
+      await rpc("eth_call", [bounded, snapshot.number, overrides]),
+    );
+    let low = 20999n;
+    let high = ceiling;
+    for (let probe = 0; high - low > 1000n && probe < 20; probe++) {
+      const gas = (low + high) / 2n;
+      try {
+        requireCompleted(
+          await rpc("eth_call", [
+            { ...transaction, gas: toQuantity(gas) },
+            snapshot.number,
+            overrides,
+          ]),
+        );
+        high = gas;
+      } catch (error) {
+        if (!(error instanceof ExecutionReverted)) throw error;
+        low = gas;
+      }
+    }
+    if (high - low > 1000n)
+      throw new ActionError(
+        "SEARCH_LIMIT",
+        "Native gas search exceeded probe budget",
+      );
+    return high;
+  }
+  async function finish(estimate: bigint): Promise<GasReport> {
+    const gas = (estimate * BigInt(10000 + policy.marginBps) + 9999n) / 10000n;
+    if (estimate < 21000n || gas > ceiling)
+      throw new Error(
+        "Guarded estimate plus margin exceeds configured/block gas cap",
+      );
+    requireCompleted(
+      await rpc("eth_call", [
+        { ...transaction, gas: toQuantity(estimate) },
+        snapshot.number,
+        overrides,
+      ]),
+    );
+    requireCompleted(
+      await rpc("eth_call", [
+        { ...transaction, gas: toQuantity(gas) },
+        snapshot.number,
+      ]),
+    );
+    await checkCanonical(rpc, snapshot);
+    return {
+      chainId: policy.chainId,
+      profileId: policy.profile.id,
+      backend: policy.profile.backend,
+      sdkVersion: SDK_VERSION,
+      metadata,
+      relayerFeeCap: options.relayerFeeCap,
+      snapshot,
+      implementation,
+      guardedEstimate: Number(estimate),
+      gasLimit: Number(gas),
+      gasPrice: gasPrice.toString(),
+      transaction,
+    };
+  }
 }
 export async function verifyBeforeSubmission(
   rpc: Rpc,
   policy: Policy,
   report: GasReport,
 ): Promise<Snapshot> {
+  policy = parsePolicy(policy);
+  if (!policy.submitEnabled)
+    throw new ActionError("CHAIN_DISABLED", "Submission is disabled");
+  requireFresh(report.snapshot, policy);
+  await checkCanonical(rpc, report.snapshot);
   const snapshot = await readSnapshot(rpc);
   requireFresh(snapshot, policy);
   await checkDeployment(rpc, policy, snapshot);
+  await readActionMetadata(
+    rpc,
+    policy,
+    snapshot,
+    report.transaction,
+    report.relayerFeeCap,
+  );
   if (BigInt(report.gasLimit) > BigInt(snapshot.gasLimit))
-    throw new Error("Gas limit exceeds current block cap");
+    throw new ActionError(
+      "POLICY_VIOLATION",
+      "Gas limit exceeds current block cap",
+    );
   requireCompleted(
     await rpc("eth_call", [
       { ...report.transaction, gas: toQuantity(report.gasLimit) },

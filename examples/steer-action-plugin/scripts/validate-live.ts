@@ -8,6 +8,8 @@ import {
   type Rpc,
   type Policy,
 } from "../gas";
+import { deploymentsFor } from "../metadata";
+import { ExecutionReverted, isExecutionFailure } from "../errors";
 import guard from "../guard-runtime.json";
 const READS = new Set([
   "eth_chainId",
@@ -29,6 +31,7 @@ async function main() {
       "tx-hash": { type: "string" },
       "max-gas": { type: "string" },
       block: { type: "string" },
+      backend: { type: "string", default: "guarded-rpc" },
     },
   });
   if (
@@ -49,9 +52,11 @@ async function main() {
     });
     if (!response.ok) throw new Error(`RPC HTTP ${response.status}`);
     const body = (await response.json()) as {
-      error?: { code: number };
+      error?: { code: number; message: string };
       result?: unknown;
     };
+    if (body.error && isExecutionFailure(body.error))
+      throw new ExecutionReverted();
     if (body.error || !Object.prototype.hasOwnProperty.call(body, "result"))
       throw new Error(
         `RPC ${method} failed (code ${body.error?.code ?? "unknown"})`,
@@ -93,14 +98,22 @@ async function main() {
   const policy: Policy = {
     relayerId: "read-only-validation",
     chainId: BigInt((await rpc("eth_chainId", [])) as string).toString(),
-    orchestrator: tx.to,
-    proxyCodeHash: keccak256(proxyCode),
-    implementationCodeHash: keccak256(implCode),
+    profile: {
+      id: "historical-diagnostic",
+      backend: values.backend as Policy["profile"]["backend"],
+      proxyCodeHash: keccak256(proxyCode),
+      implementationCodeHash: keccak256(implCode),
+    },
+    estimateEnabled: true,
+    submitEnabled: false,
+    deadlineMs: 30000,
     maxGas: Number(values["max-gas"]),
     maxGasPrice: BigInt(tx.gasPrice).toString(),
     marginBps: 1000,
     maxSnapshotAgeSeconds: 60,
   };
+  if (deploymentsFor(policy).Orchestrator.toLowerCase() !== tx.to.toLowerCase())
+    throw new Error("Transaction destination differs from SDK Orchestrator");
   const transaction = {
     from: tx.from,
     to: tx.to,
@@ -143,14 +156,16 @@ async function main() {
         receiptStatus: receipt.status,
         chainId: policy.chainId,
         snapshot,
-        proxyCodeHash: policy.proxyCodeHash,
+        proxyCodeHash: policy.profile.proxyCodeHash,
         implementation,
-        implementationCodeHash: policy.implementationCodeHash,
+        implementationCodeHash: policy.profile.implementationCodeHash,
         guardRuntimeHash: keccak256(guard.runtime),
         originalGas: Number(BigInt(tx.gas)),
         originalOutcome: await outcome(tx.gas),
         ordinaryEstimate: Number(BigInt(ordinary)),
         ordinaryEstimateOutcome: await outcome(ordinary),
+        backend: report.backend,
+        metadata: report.metadata,
         guardedEstimate: report.guardedEstimate,
         guardedEstimateDirectOutcome: await outcome(
           toQuantity(report.guardedEstimate),

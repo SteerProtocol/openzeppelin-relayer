@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import {
+  Contract,
   ContractFactory,
   Interface,
   JsonRpcProvider,
@@ -20,6 +21,7 @@ import {
   type Rpc,
   type Policy,
 } from "../gas";
+import { ExecutionReverted, isExecutionFailure } from "../errors";
 import guard from "../guard-runtime.json";
 let anvil: ChildProcess;
 let rpc: Rpc;
@@ -72,8 +74,10 @@ before(
       });
       const body = (await response.json()) as {
         result: unknown;
-        error?: { message: string };
+        error?: { code: number; message: string };
       };
+      if (body.error && isExecutionFailure(body.error))
+        throw new ExecutionReverted();
       if (body.error) throw new Error(body.error.message);
       return body.result;
     };
@@ -126,16 +130,37 @@ before(
       await deployed.waitForDeployment();
       return deployed.getAddress();
     }
-    implementation = await deploy("FixtureOrchestrator", [sender]);
+    const metadata = await deploy("FixtureMetadata");
+    implementation = await deploy("FixtureOrchestrator", [sender, metadata]);
     proxy = await deploy("FixtureProxy", [implementation]);
     target = await deploy("FixtureTarget");
+    const setup = new Contract(
+      metadata,
+      compiled.contracts["fixtures.sol"].FixtureMetadata.abi,
+      signer,
+    );
+    await (await setup.setup(proxy, target)).wait();
     snapshot = (await rpc("eth_blockNumber", [])) as string;
     policy = {
       relayerId: "local",
       chainId: "31337",
-      orchestrator: proxy,
-      proxyCodeHash: keccak256(await provider.getCode(proxy)),
-      implementationCodeHash: keccak256(await provider.getCode(implementation)),
+      profile: {
+        id: "local-v1",
+        backend: "guarded-rpc",
+        proxyCodeHash: keccak256(await provider.getCode(proxy)),
+        implementationCodeHash: keccak256(
+          await provider.getCode(implementation),
+        ),
+        deployments: {
+          Orchestrator: proxy,
+          GasVault: metadata,
+          VaultRegistry: metadata,
+          StrategyRegistry: metadata,
+        },
+      },
+      estimateEnabled: true,
+      submitEnabled: true,
+      deadlineMs: 30000,
       maxGas: 1500000,
       maxGasPrice: "2000000000",
       marginBps: 1000,
@@ -260,5 +285,26 @@ test("guard rejects unauthorized keeper and permanent target failure", async () 
       blockTag: snapshot,
       gasPrice: "1000000000",
     }),
+  );
+});
+
+test("native call search completes the original action on the isolated EVM", async () => {
+  const native = {
+    ...policy,
+    profile: { ...policy.profile, backend: "native-call-search" as const },
+  };
+  const report = await estimateAction(
+    rpc,
+    native,
+    { data, mode: "estimate" },
+    sender,
+    { blockTag: snapshot, gasPrice: "1000000000" },
+  );
+  assert.equal(report.backend, "native-call-search");
+  requireCompleted(
+    await rpc("eth_call", [
+      { ...report.transaction, gas: toQuantity(report.gasLimit) },
+      snapshot,
+    ]),
   );
 });

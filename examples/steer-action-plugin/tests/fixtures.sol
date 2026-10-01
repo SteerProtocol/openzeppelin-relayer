@@ -22,11 +22,12 @@ contract FixtureProxy {
 contract FixtureOrchestrator {
     address immutable keeper;
     uint256 public executions;
-    constructor(address keeper_) { keeper = keeper_; }
+    address public immutable gasVault;
+    constructor(address keeper_, address gasVault_) { keeper = keeper_; gasVault = gasVault_; }
     function executeAction(address target, uint256, bytes[] calldata calls, uint256[] calldata, bytes32) external returns (uint8) {
         require(msg.sender == keeper, "Not keeper");
         require(tx.origin == keeper, "Wrong origin");
-        (bool ok,) = address(this).call{gas: 500000}(abi.encodeWithSignature("_executeAction(address,bytes[])", target, calls));
+        (bool ok,) = address(this).call{gas: FixtureMetadata(gasVault).gasAvailableForTransaction(target)}(abi.encodeWithSignature("_executeAction(address,bytes[])", target, calls));
         if (ok) { executions++; return 1; }
         return 0;
     }
@@ -46,4 +47,18 @@ contract FixtureTarget {
         result = v;
     }
     function fail() external pure { revert("Permanent target failure"); }
+}
+
+contract FixtureMetadata {
+    address public orchestrator;
+    address public vaultRegistry = address(this);
+    address public strategyRegistry = address(this);
+    address public target;
+    function setup(address orchestrator_, address target_) external { orchestrator = orchestrator_; target = target_; }
+    struct VaultData { uint8 state; uint256 tokenId; uint256 vaultID; string payloadIpfs; address vaultAddress; string beaconName; }
+    struct Strategy { uint256 id; string name; address owner; string execBundle; uint128 maxGasCost; uint128 maxGasPerAction; }
+    function getVaultDetails(address vault) external view returns (VaultData memory) { return VaultData(3, 1, 1, "ipfs", vault == target ? vault : address(0), "fixture"); }
+    function getRegisteredStrategy(uint256 id) external pure returns (Strategy memory) { return Strategy(id, "fixture", address(1), "ipfs", 2000000000, 500000); }
+    function ethBalances(address) external pure returns (uint256) { return 100 ether; }
+    function gasAvailableForTransaction(address) external view returns (uint256) { require(tx.gasprice <= 2000000000, "fee cap"); return 500000; }
 }

@@ -43,13 +43,31 @@ test("only canonical action calldata and explicit modes; no caller overrides", (
     }),
   );
 });
+test("zero action target is rejected before discovery", () => {
+  assert.throws(
+    () =>
+      parseAction({
+        data: ACTION_ABI.encodeFunctionData("executeAction", [
+          "0x" + "00".repeat(20),
+          1,
+          [],
+          [],
+          "0x" + "00".repeat(32),
+        ]),
+        mode: "estimate",
+      }),
+    /Reserved/,
+  );
+});
 test("configuration rejects missing hashes, unbounded/unsafe caps and reserved identities", () => {
   for (const changed of [
     { maxGas: -1 },
     { maxGas: 1e12 },
     { maxGasPrice: "9007199254740992" },
-    { implementationCodeHash: "" },
-    { orchestrator: CODE_COPY },
+    { profile: { ...policy.profile, implementationCodeHash: "" } },
+    {
+      profile: { ...policy.profile, deployments: { Orchestrator: CODE_COPY } },
+    },
     { chainId: "0x1" },
     { marginBps: 10001 },
   ])
@@ -64,7 +82,7 @@ test("bounded guard estimate then direct check; no state/storage overrides", asy
     from,
   );
   assert.equal(report.gasLimit, 550000);
-  const estimate = calls.find((c) => c.method === "eth_estimateGas")!;
+  const estimate = calls.filter((c) => c.method === "eth_estimateGas").at(-1)!;
   assert.equal((estimate.params[0] as { from: string }).from, from);
   assert.equal(estimate.params[1], report.snapshot.number);
   assert.deepEqual(
@@ -95,7 +113,11 @@ test("PENDING and malformed returns fail closed", () => {
 });
 test("ordinary direct PENDING prevents accepting a guarded estimate", async () => {
   const { rpc } = mockRpc((method, params) =>
-    method === "eth_call" && params.length === 2 ? pending : undefined,
+    method === "eth_call" &&
+    params.length === 2 &&
+    (params[0] as { data: string }).data === data
+      ? pending
+      : undefined,
   );
   await assert.rejects(
     estimateAction(rpc, policy, { data, mode: "estimate" }, from),
@@ -163,7 +185,11 @@ test("fresh unmodified pre-submission call checks new snapshot and deployment", 
     calls.filter((c) => c.method === "eth_call").at(-1)!.params.length,
     2,
   );
-  const changed = mockRpc((m) => (m === "eth_call" ? pending : undefined));
+  const changed = mockRpc((m, p) =>
+    m === "eth_call" && (p[0] as { data: string }).data === data
+      ? pending
+      : undefined,
+  );
   await assert.rejects(
     verifyBeforeSubmission(changed.rpc, policy, report),
     /COMPLETED/,
@@ -186,14 +212,20 @@ test("stale snapshots are rejected", () => {
 });
 
 test("oversized provider estimate never causes an over-cap simulation", async () => {
-  const { rpc, calls } = mockRpc((method) =>
-    method === "eth_estimateGas" ? "0xffffffff" : undefined,
+  const { rpc, calls } = mockRpc((method, params) =>
+    method === "eth_estimateGas" &&
+    (params[2] as Record<string, { code: string }>)[proxy].code !==
+      "0x60006000fd"
+      ? "0xffffffff"
+      : undefined,
   );
   await assert.rejects(
     estimateAction(rpc, policy, { data, mode: "estimate" }, from),
     /cap/,
   );
-  for (const call of calls.filter((call) => call.method === "eth_call")) {
+  for (const call of calls.filter(
+    (call) => call.method === "eth_call" && "gas" in (call.params[0] as object),
+  )) {
     assert.ok(
       BigInt((call.params[0] as { gas: string }).gas) <= BigInt(policy.maxGas),
     );

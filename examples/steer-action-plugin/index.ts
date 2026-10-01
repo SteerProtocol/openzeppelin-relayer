@@ -1,3 +1,9 @@
+import {
+  ActionError,
+  ExecutionReverted,
+  isExecutionFailure,
+  withinDeadline,
+} from "./errors";
 import type { PluginContext, Relayer } from "@openzeppelin/relayer-sdk";
 import {
   estimateAction,
@@ -9,27 +15,7 @@ import {
   type Rpc,
 } from "./gas";
 
-export async function withinDeadline<T>(
-  operation: () => Promise<T>,
-  deadline: number,
-): Promise<T> {
-  const remaining = deadline - Date.now();
-  if (remaining <= 0) throw new Error("Action validation deadline exceeded");
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      operation(),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error("Action validation deadline exceeded")),
-          remaining,
-        );
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
+export { withinDeadline } from "./errors";
 
 export function relayerRpc(
   relayer: Pick<Relayer, "rpc">,
@@ -45,8 +31,11 @@ export function relayerRpc(
       response.error ||
       !Object.prototype.hasOwnProperty.call(response, "result")
     ) {
+      if (response.error && isExecutionFailure(response.error))
+        throw new ExecutionReverted();
       // Avoid propagating provider URLs, credentials or full calldata in errors.
-      throw new Error(
+      throw new ActionError(
+        "RPC_UNAVAILABLE",
         `Relayer RPC failed for ${method} (code ${response.error?.code ?? "unknown"})`,
       );
     }
@@ -62,7 +51,7 @@ export async function handler(context: PluginContext) {
   const relayer = context.api.useRelayer(policy.relayerId);
   // Finish validation before the configured 120-second runner timeout. A timed
   // out read cannot later continue into an enqueue operation.
-  const deadline = Date.now() + 30000;
+  const deadline = Date.now() + policy.deadlineMs;
   const info = await withinDeadline(() => relayer.getRelayer(), deadline);
   if (
     info.id !== policy.relayerId ||
@@ -74,7 +63,15 @@ export async function handler(context: PluginContext) {
     throw new Error("Configured EVM relayer is unavailable");
   const rpc = relayerRpc(relayer, deadline);
   requireFresh(await readSnapshot(rpc), policy);
-  const report = await estimateAction(rpc, policy, action, info.address);
+  const feeCap =
+    info.policies && "gas_price_cap" in info.policies
+      ? (info.policies.gas_price_cap ?? undefined)
+      : undefined;
+  if (feeCap !== undefined && (!Number.isSafeInteger(feeCap) || feeCap < 0))
+    throw new Error("Relayer fee cap exceeds SDK numeric precision");
+  const report = await estimateAction(rpc, policy, action, info.address, {
+    relayerFeeCap: feeCap === undefined ? undefined : String(feeCap),
+  });
   requireFresh(report.snapshot, policy);
   if (action.mode === "estimate") return { mode: "estimate", report };
   const submissionSnapshot = await verifyBeforeSubmission(rpc, policy, report);
@@ -95,6 +92,7 @@ export async function handler(context: PluginContext) {
   return {
     mode: "submit",
     transactionId: submitted.id,
+    relayerId: policy.relayerId,
     report,
     submissionSnapshot,
   };

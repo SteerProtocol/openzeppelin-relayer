@@ -1,136 +1,165 @@
 # Steer action gas plugin
 
-An opt-in plugin for `executeAction(address,uint256,bytes[],uint256[],bytes32)`.
-It estimates gas only when the action completes, then submits the original
-transaction through the normal relayer queue. No deployed contract changes,
-keeper licenses, balances, votes, or storage overrides are required.
+An opt-in plugin for registered Steer vault actions through `Orchestrator.executeAction`.
+It estimates only an action that returns exactly `COMPLETED`, then submits the original
+transaction through the relayer. It does not change deployed contracts or build swap calldata.
 
-## Flow
+## Discovery and policy
 
-1. The processor calls the plugin with `{ "data": "0x...", "mode": "estimate" }`
-   or `{ "data": "0x...", "mode": "submit" }`.
-2. The plugin obtains the keeper address from the configured relayer and pins a
-   block. It checks chain ID, proxy runtime hash and implementation runtime hash.
-3. For simulation only, it replaces proxy code with `ActionSimulationGuard` and
-   places the original proxy runtime at an unused code-copy address. The guard
-   delegates to that runtime, retaining proxy storage, `msg.sender`, `tx.origin`,
-   implementation routing and internal self-calls. Only `executeAction` results
-   are asserted: the exact 32-byte return must equal `COMPLETED` (1).
-4. It establishes successful execution at the gas ceiling, estimates the guarded
-   path, verifies that estimate, adds a configured margin and checks the original
-   transaction with **no overrides**. Errors stop the request; no ordinary
-   estimator fallback or unbounded gas growth is used.
-5. Submit mode repeats the unmodified check against a fresh block and enqueues
-   once, using explicit `gas_limit`, the checked initial legacy `gas_price`, and
-   a short `valid_until`. It returns the relayer transaction ID without waiting
-   for mining. The normal relayer signs, broadcasts and tracks the transaction.
+`@steerprotocol/sdk@3.8.0` supplies deployment addresses and GasVault, VaultRegistry and
+StrategyRegistry ABIs. The SDK does not export the Orchestrator ABI. `orchestrator-abi.json`
+is copied from `@steerprotocol/contracts@3.1.7`, `deployments/arbitrum.json`,
+`contracts.Orchestrator.abi`. It describes the reviewed v1 profile. New implementations
+must have separately reviewed code hashes and compatible interfaces; discovering an
+address does not approve its implementation.
 
-The caller supplies only calldata and an explicit mode. Relayer identity,
-Orchestrator, hashes and caps come from trusted deployment configuration.
-Calldata must match the inspected ABI, use canonical encoding and fit 64 KiB.
-The guard source and reproducible runtime are included. Never install this guard
-as a live proxy implementation or deploy it as an execution wrapper.
+At the pinned block, the plugin validates Orchestrator/GasVault/registry relationships,
+registered vault identity, strategy ID, fee ceiling, inner gas allowance and funding.
+The effective fee ceiling is the minimum of operator, strategy and relayer caps when the
+relayer exposes one. The fee-dependent GasVault getter is also checked from the keeper.
+A vault state is reported, rather than used as an invented blanket eligibility rule.
+The original action remains the execution eligibility check.
+
+Configuration separates:
+
+- `profile`: reviewed ID, backend, proxy/implementation hashes. Addresses default to the
+  SDK. Optional `profile.deployments` overrides are for reviewed alternate deployments
+  and isolated fixtures, never request parameters.
+- Operator policy: `relayerId`, expected `chainId`, required `maxGas` outer ceiling and
+  `maxGasPrice` fee ceiling in wei, margin, freshness and deadline.
+- `estimateEnabled` and `submitEnabled`: both default false. Submission requires both true.
+
+Inner `maxGasPerAction` is read live. It is not substituted for outer gas: the Orchestrator,
+self-call and reimbursement consume additional gas. Keep the outer ceiling explicit.
+Scratch address, EIP-1967 slot and `COMPLETED=1` are reviewed protocol constants.
+
+## Estimation flow
+
+1. Obtain the signer from the configured relayer, check availability and chain ID, and pin
+   a block number/hash. Verify approved Orchestrator proxy and implementation code hashes.
+2. Resolve the deployment graph and vault strategy metadata at that block. Fail closed on
+   missing registration, graph mismatch, unacceptable fees or insufficient funding.
+3. Verify the simulation scratch address has no code, nonce or balance. Prove `eth_call`
+   honors a code override using a forced empty return.
+4. Install `ActionSimulationGuard` only in simulation. It delegates to the copied proxy
+   runtime, preserving address/storage, keeper, origin, implementation and self-call routing.
+   Exact `COMPLETED` is required. Never install the guard in a live proxy or deploy it as
+   an execution wrapper.
+5. Establish completion at the bounded outer ceiling and use the selected backend:
+   - `guarded-rpc`: first prove `eth_estimateGas` honors overrides using forced revert,
+     then estimate the guarded path.
+   - `native-call-search`: use only guarded `eth_call` probes. Search between 21,000 gas
+     and the ceiling, with at most 20 probes and 1,000-gas tolerance. Only positively
+     identified execution reverts/OOG count as failed probes. Transport/unknown errors
+     abort. Every probe uses the same pinned RPC state; no TEVM or persistent fork exists.
+6. Apply the bounded margin, verify the guarded estimate and require the original call
+   with no overrides to return `COMPLETED`. Recheck block canonicality.
+7. Submit mode requires a fresh original snapshot, rechecks its canonicality, then repeats
+   deployment, live limits, funding and original completion at a fresh block. Enqueue once
+   with checked initial legacy fee, bounded gas and short validity. Never retry an ambiguous
+   enqueue or fall back to an unguarded endpoint.
+
+The request remains `{data, mode: "estimate" | "submit"}`. Caller-provided signer,
+destination, fees, profiles and overrides are rejected. Only canonical `executeAction`
+calldata, up to 64 KiB, is accepted. Inner calls remain opaque and are executed as supplied.
+
+The report adds profile ID, backend, SDK version, resolved addresses, strategy ID/state,
+inner allowance, fee ceiling and gas funding. Metadata/fee quantities use decimal strings;
+existing outer gas fields remain bounded safe numbers for API compatibility. Typed action
+errors carry stable codes in their messages; provider URLs and raw errors are redacted.
+Orchestrator-caught target errors cannot be decoded after their revert bytes are discarded.
 
 ## Register and call
 
-Requires Node 22.14+ and an RPC supporting recent state at explicit block numbers
-and **code overrides on both `eth_call` and `eth_estimateGas`**. Full archive
-state is needed only for historical validation, not normal live submission.
-Validate the actual provider first.
+Requires Node 22.14+, recent state at explicit block numbers, `eth_call` code overrides,
+and normal chain/block/code/storage/account/fee reads. `guarded-rpc` additionally requires
+overrides on `eth_estimateGas`. Archive state is needed only for historical replay.
 
-Install this directory as `/app/plugins/steer-action-plugin` in the relayer image
-or mount it there. Install its runtime dependencies with
-`npm ci --omit=dev --ignore-scripts` inside that directory. Merge the plugin entry
-from `config.fragment.json` into the existing relayer configuration. The fragment
-is deliberately invalid until its identity and code hashes are filled in.
-Resolve hashes from the intended deployment, verify them independently and repeat
-that review after an upgrade. The example caps and 10% margin are experimental
-settings, not recommended values for every vault.
+Install this directory in the relayer image, install its runtime dependencies with
+`npm ci --omit=dev --ignore-scripts`, and register a separate policy for each keeper.
+The fragment deliberately requires verified code hashes and an operator fee cap.
+Use plugin IDs `steer-action-<relayerId>`, such as `steer-action-arbitrum-node-1`.
+Old configuration with top-level `orchestrator`/hashes must be migrated to `profile`.
+No new chain is automatically enabled by its presence in the SDK.
 
-Keep the plugin timeout at 120 seconds or more. Validation has a shared 30-second
-read deadline; timed-out reads cannot later continue into transaction submission.
-Use authenticated POST only:
+Keep runner timeout at 120 seconds or more; the shared read deadline defaults to 30 seconds
+and must be shorter than the runner and gateway budgets. For a 30-second HTTP gateway,
+configure `deadlineMs` at most 20,000 and verify end-to-end timing. Timed-out reads cannot
+later continue into enqueue. Submission itself can have an ambiguous transport outcome.
 
 ```http
-POST /api/v1/plugins/steer-action-gas/call
+POST /api/v1/plugins/steer-action-arbitrum-node-1/call
 Content-Type: application/json
-Authorization: Bearer <existing relayer API credential>
+Authorization: Bearer <existing relayer credential>
 
-{"params":{"mode":"submit","data":"0x<encoded executeAction>"}}
+{"params":{"mode":"estimate","data":"0x<encoded executeAction>"}}
 ```
 
-The HTTP API returns its usual response envelope. Its `data` contains
-`transactionId`, the gas report, and the final submission snapshot. Estimate mode
-returns the report without enqueueing. Configure the endpoint only for callers
-already authorized to exercise that keeper. This plugin does not replace keeper
-votes or processor authorization.
+Use authenticated POST and the standard response envelope (`raw_response: false`). Submit
+returns `transactionId`, `relayerId`, report and submission snapshot. Poll that relayer's
+transaction API and verify receipt status plus matching `ActionExecuted` before success.
+The plugin does not wait for mining or replace keeper voting/authorization.
 
-For the processor, change its Orchestrator action submission path in
-`relayer-transaction-manager.ts` from the generic transaction endpoint to this
-plugin endpoint. Keep the existing resolved node/relayer mapping; use a separate
-plugin configuration per keeper. Add the endpoint to the API Gateway proxy and
-IAM allowlist. Track the returned transaction ID through the existing relayer
-transaction/receipt APIs, and require the matching Orchestrator `ActionExecuted`
-event and action hash before recording action success. Other transaction kinds
-retain their current endpoint. This PR does not modify or deploy the processor
-or gateway infrastructure.
+## Processor and IAM integration
+
+The processor's companion change retains `RELAYER_CHAINS=['arbitrum']` and introduces an
+independent, initially empty `GUARDED_TEND_CHAINS`. Selected `executeAction` requests use
+this plugin; votes and funding retain the normal transaction endpoint. Plugin errors and
+ambiguous responses do not cause a generic submit fallback. The processor verifies action
+hash and event emitter/keeper before completion callbacks.
+
+Before enabling guarded routing, the IAM gateway must admit only the configured plugin IDs
+on `POST /api/v1/plugins/<id>/call`, forward the request to the existing bearer-authenticated
+relayer upstream, and grant matching `execute-api:Invoke` resources. Do not expose plugin
+listing, administration, GET invocation or arbitrary plugin IDs. The deployed proxy source
+has not been located or changed; gateway access is an explicit rollout gate.
+
+Enable estimate-only Arbitrum shadow traffic first. Verify all keeper identities and
+representative vault families, then opt into guarded submission. Bittensor uses
+`native-call-search` when validated, but remains disabled by default. Local native-search
+success is not production Bittensor validation. Validate each additional chain separately.
+Rollback stops new guarded requests; reconcile already accepted transactions before retry.
 
 ## Validation
 
-From this directory, with Anvil installed:
-
 ```sh
+pnpm --dir ../../plugins install --frozen-lockfile --ignore-scripts
 npm ci --ignore-scripts
 npm run validate
 ```
 
-For the runtime integration test, install the repository's existing plugin
-runtime dependencies first: `pnpm --dir ../../plugins install --frozen-lockfile
---ignore-scripts`. `npm run validate` checks reproducible Solidity bytecode,
-TypeScript, formatting, failure/cap/reorg cases, actual Anvil execution, and the repository's
-real compiler and pooled executor over its socket protocol. Only the isolated
-Anvil test signs/sends a local transaction. Its fixture models the inspected
-contract boundaries; it is not a copy of the production contracts.
+This checks reproducible Solidity runtime, types, formatting, metadata and policy violations,
+provider override capabilities, bounded search/error handling, reorgs/freshness, actual Anvil
+execution and the repository's pooled compiler/socket runtime. Only the isolated Anvil test
+sends a local transaction. Fixtures model execution boundaries, not all production vaults.
 
-Read-only historical validation against deployed bytecode:
+Historical diagnostic, with a read-only RPC allowlist and no wallet/submission API:
 
 ```sh
 RPC_URL=<archive RPC> npm run validate:live -- \
   --tx-hash 0xb50977e00631abc7abb39157cf52b8d8f0b634868458931c311c9bfdfd876289 \
-  --max-gas 1000000
+  --max-gas 1000000 --backend guarded-rpc
 ```
 
-The script has a read-only RPC allowlist, no wallet and no submission API. It uses
-block N-1 and original legacy gas price, verifies the block hash, and prints a
-small report without RPC URLs or calldata. Hash discovery here is research only;
-production requires trusted configured hashes. Historical results are saved in
-`validation-results.json`.
+Use `--backend native-call-search` to exercise native search. The script discovers diagnostic
+hashes from the historical deployment, not production approval. It requires the transaction's
+Orchestrator to match the SDK, uses parent-block state and original legacy fee, and verifies
+canonicality. Prior results in `validation-results.json` predate this metadata expansion;
+they are not new replay evidence. Failed historical actions can terminate with a non-completed
+result; increasing gas does not repair an invalid swap. Archive availability is a separate gate.
 
-## Limits
+## Limits and enablement gates
 
-- A successful simulation is not a guarantee at mining time. Pending transactions,
-  state changes, queue delay and replacement fees remain relevant. The plugin is
-  an explicit entry point, not a signing or replacement lifecycle hook.
-- Configure the relayer's own `gas_price_cap` consistently with vault limits.
-  Replacements can change fees; this plugin does not revalidate replacements.
-  Inner GasVault allowances and funding limits are unchanged.
-- The guard adds delegate calls and changes code visibility/access warming. Its
-  estimate is a candidate, checked against the original execution path. The
-  margin needs validation across representative actions, not one transaction.
-- `PENDING` can have causes besides insufficient gas. Persistent failure at the
-  configured ceiling stops submission rather than increasing gas indefinitely.
-- `_executeAction` discards target revert bytes. This guard does not recover
-  erased errors; call tracing is still needed for detailed failure diagnosis.
-- No durable action idempotency is implemented here. If enqueue times out, its
-  outcome is unknown. Reconcile with the existing transaction/action records
-  before retrying; the plugin never automatically resubmits.
-- Historical N-1 simulations exclude earlier transactions in the mined block.
-  Saved results prove this pinned snapshot, not an exact transaction-index replay,
-  future execution, or production processor integration.
-
-The existing `plugins` regression suite was also checked at base commit
-`2255fb47ae925cd0e00c4de6bda6822ebb876a1f`: all 173 assertions pass, then a
-pre-existing dangling `sendTransaction` socket timeout causes a nonzero exit on
-Node 26.7.0. The identical failure was reproduced from an untouched main-branch
-snapshot. The new plugin validation exits successfully; existing runtime source
-is unchanged by this PR.
+- Simulation does not guarantee future mining success. State, queue delay and fee replacement
+  can change. This is an explicit endpoint, not a replacement/signing lifecycle hook.
+- Relayer replacement fees are not revalidated here. Validate native transaction type, relayer
+  fee caps and replacement behavior for each chain before enabling. No EIP-1559 expansion is
+  included in this change.
+- Guard overhead and access warming can shift estimates. Verify original-call completion and
+  validate margins across representative actions. Gas search need not find a mathematical
+  minimum for gas-dependent contracts; only a verified bounded candidate is accepted.
+- Failure at the ceiling stops submission. No swap recomputation or fork scheduler fix is included.
+- No durable idempotency/reconciliation worker is added. An accepted submission with a lost
+  response must be reconciled before another attempt. Retain transaction IDs and action records.
+- The SDK is a pinned dependency with a broad transitive dependency tree. Review dependency
+  audit findings when updating it; do not run automatic breaking dependency fixes in this PR.

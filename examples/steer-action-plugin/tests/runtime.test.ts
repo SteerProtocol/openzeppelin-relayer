@@ -4,6 +4,7 @@ import { createServer, type Socket } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { ExecutionReverted } from "../errors";
 import { data, mockRpc, policy } from "./helpers";
 // Load the repository's actual compiler and pooled executor, not a replica.
 const { compilePlugin } = require("../../../plugins/lib/compiler") as {
@@ -51,7 +52,19 @@ test("actual pooled runtime bundles and invokes plugin over its relayer socket p
             result = {
               jsonrpc: "2.0",
               id: request.payload.id,
-              result: await rpc(request.payload.method, request.payload.params),
+              ...(await rpc(
+                request.payload.method,
+                request.payload.params,
+              ).then(
+                (result) => ({ result }),
+                (error) => {
+                  if (error instanceof ExecutionReverted)
+                    return {
+                      error: { code: 3, message: "execution reverted" },
+                    };
+                  throw error;
+                },
+              )),
             };
           else if (request.method === "sendTransaction") {
             queued.push(request.payload);

@@ -49,11 +49,12 @@ test("submit queues original payload once with checked gas and initial fee", asy
   const { ctx, sent, calls } = context("submit");
   const result = await handler(ctx);
   assert.equal(result.transactionId, "tx-123");
+  assert.equal(result.relayerId, "keeper");
   const request = sent[0] as Record<string, unknown>;
   assert.ok(Date.parse(request.valid_until as string) > Date.now());
   const { valid_until, ...fields } = request;
   assert.deepEqual(fields, {
-    to: policy.orchestrator,
+    to: policy.profile.deployments!.Orchestrator,
     data,
     value: 0,
     gas_limit: 550000,
@@ -136,4 +137,21 @@ test("validation deadline rejects hung reads and prevents later continuation", a
     withinDeadline(async () => 1, Date.now() - 1),
     /deadline/,
   );
+});
+
+test("disabled submission and changed relayer fee cap never enqueue", async () => {
+  const disabled = context("submit");
+  disabled.ctx.config = { ...policy, submitEnabled: false };
+  await assert.rejects(handler(disabled.ctx), /disabled/);
+  assert.equal(disabled.sent.length, 0);
+  const capped = context("submit");
+  capped.relayer.getRelayer = async () => ({
+    id: "keeper",
+    network_type: "evm",
+    address: "0x1000000000000000000000000000000000000001",
+    paused: false,
+    policies: { gas_price_cap: 1 },
+  });
+  await assert.rejects(handler(capped.ctx), /cap/);
+  assert.equal(capped.sent.length, 0);
 });
