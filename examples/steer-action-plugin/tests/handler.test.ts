@@ -217,6 +217,9 @@ test("a server that does not acknowledge the ceiling requires reconciliation wit
     c.sent.push(p);
     return { id: "tx-123" } as any;
   };
-  await assert.rejects(handler(c.ctx), /reconcile accepted transaction/);
+  await assert.rejects(
+    handler(c.ctx),
+    /tx-123; reconcile accepted transaction/,
+  );
   assert.equal(c.sent.length, 1);
 });

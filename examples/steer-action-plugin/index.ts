@@ -100,7 +100,7 @@ export async function handler(context: PluginContext) {
     feeCeilingWei
   )
     throw new Error(
-      "Relayer did not acknowledge stored fee ceiling; reconcile accepted transaction before retrying",
+      `Relayer did not acknowledge stored fee ceiling for transaction ${submitted.id}; reconcile accepted transaction before retrying`,
     );
   return {
     feeCeilingWei,
