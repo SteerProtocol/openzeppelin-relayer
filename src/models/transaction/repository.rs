@@ -305,6 +305,12 @@ pub struct EvmTransactionDataSignature {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvmTransactionData {
     #[serde(
+        default,
+        serialize_with = "serialize_optional_u128",
+        deserialize_with = "deserialize_optional_u128"
+    )]
+    pub fee_ceiling_wei: Option<u128>,
+    #[serde(
         serialize_with = "serialize_optional_u128",
         deserialize_with = "deserialize_optional_u128",
         default
@@ -336,6 +342,26 @@ pub struct EvmTransactionData {
 }
 
 impl EvmTransactionData {
+    /// Enforces the stored action ceiling on fully resolved signing fees.
+    pub fn validate_fee_ceiling(&self) -> Result<(), TransactionError> {
+        if let Some(cap) = self.fee_ceiling_wei {
+            let fees = [
+                self.gas_price,
+                self.max_fee_per_gas,
+                self.max_priority_fee_per_gas,
+            ];
+            if cap == 0
+                || fees.iter().all(Option::is_none)
+                || fees.into_iter().flatten().any(|fee| fee > cap)
+            {
+                return Err(TransactionError::ValidationError(
+                    "Transaction fee exceeds fee_ceiling_wei or resolved fee is missing".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Creates transaction data for replacement by combining existing transaction data with new request data.
     ///
     /// Preserves critical fields like chain_id, from address, and nonce while applying new transaction parameters.
@@ -349,6 +375,10 @@ impl EvmTransactionData {
     /// New `EvmTransactionData` configured for replacement transaction
     pub fn for_replacement(old_data: &EvmTransactionData, request: &EvmTransactionRequest) -> Self {
         Self {
+            fee_ceiling_wei: match (old_data.fee_ceiling_wei, request.fee_ceiling_wei) {
+                (Some(old), Some(new)) => Some(old.min(new)),
+                (old, new) => old.or(new),
+            },
             // Preserve existing fields from old transaction
             chain_id: old_data.chain_id,
             from: old_data.from.clone(),
@@ -435,6 +465,7 @@ impl EvmTransactionData {
 impl Default for EvmTransactionData {
     fn default() -> Self {
         Self {
+            fee_ceiling_wei: None,
             from: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".to_string(), // Standard Hardhat test address
             to: Some("0x70997970C51812dc3A010C7d01b50e0d17dc79C8".to_string()), // Standard Hardhat test address
             gas_price: Some(20000000000),
@@ -972,6 +1003,7 @@ impl
                     delete_at: None,
                     network_type: NetworkType::Evm,
                     network_data: NetworkTransactionData::Evm(EvmTransactionData {
+                        fee_ceiling_wei: evm_request.fee_ceiling_wei,
                         gas_price: evm_request.gas_price,
                         gas_limit: evm_request.gas_limit,
                         nonce: None,
@@ -1429,6 +1461,7 @@ mod tests {
     // Create a helper function to generate a sample EvmTransactionData for testing
     fn create_sample_evm_tx_data() -> EvmTransactionData {
         EvmTransactionData {
+            fee_ceiling_wei: None,
             gas_price: Some(20_000_000_000),
             gas_limit: Some(21000),
             nonce: Some(5),
@@ -1924,6 +1957,7 @@ mod tests {
             value: U256::from(2000000000000000000u64), // 2 ETH
             data: Some("0xNewData".to_string()),
             gas_limit: Some(25000),
+            fee_ceiling_wei: None,
             gas_price: Some(30000000000), // 30 Gwei (should be ignored)
             max_fee_per_gas: Some(40000000000), // Should be ignored
             max_priority_fee_per_gas: Some(2000000000), // Should be ignored
@@ -1972,6 +2006,7 @@ mod tests {
             value: U256::from(1000000000000000000u128),
             data: Some("0x1234".to_string()),
             gas_limit: Some(21000),
+            fee_ceiling_wei: Some(30_000_000_000),
             gas_price: Some(20000000000),
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
@@ -2033,6 +2068,7 @@ mod tests {
         assert!(transaction.is_canceled == Some(false));
 
         if let NetworkTransactionData::Evm(evm_data) = transaction.network_data {
+            assert_eq!(evm_data.fee_ceiling_wei, Some(30_000_000_000));
             assert_eq!(evm_data.from, relayer_model.address);
             assert_eq!(
                 evm_data.to,
@@ -2334,6 +2370,7 @@ mod tests {
             value: U256::from(2000000000000000000u64),
             data: Some("0xNewData".to_string()),
             gas_limit: Some(25000),
+            fee_ceiling_wei: None,
             gas_price: None,
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
@@ -3318,6 +3355,7 @@ mod tests {
             valid_until: None,
             delete_at: None,
             network_data: NetworkTransactionData::Evm(EvmTransactionData {
+                fee_ceiling_wei: None,
                 gas_price: None,
                 gas_limit: Some(21000),
                 nonce: Some(0),
@@ -3529,5 +3567,100 @@ mod tests {
             // XDR parse failed or no time_bounds - should return None (unbounded)
             assert!(result.is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod fee_ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn fee_ceiling_persists_and_old_records_remain_compatible() {
+        let data = EvmTransactionData {
+            fee_ceiling_wei: Some(u128::MAX),
+            ..Default::default()
+        };
+        let mut json = serde_json::to_value(&data).unwrap();
+        assert_eq!(json["fee_ceiling_wei"], u128::MAX.to_string());
+        let response: crate::models::TransactionResponse = TransactionRepoModel {
+            network_data: NetworkTransactionData::Evm(data.clone()),
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(
+            serde_json::to_value(response).unwrap()["fee_ceiling_wei"],
+            u128::MAX.to_string()
+        );
+        assert_eq!(
+            serde_json::from_value::<EvmTransactionData>(json.clone())
+                .unwrap()
+                .fee_ceiling_wei,
+            Some(u128::MAX)
+        );
+        json.as_object_mut().unwrap().remove("fee_ceiling_wei");
+        assert_eq!(
+            serde_json::from_value::<EvmTransactionData>(json)
+                .unwrap()
+                .fee_ceiling_wei,
+            None
+        );
+    }
+
+    #[test]
+    fn fee_ceiling_cannot_be_removed_or_raised_by_replacement() {
+        let old = EvmTransactionData {
+            fee_ceiling_wei: Some(100),
+            ..Default::default()
+        };
+        for (requested, expected) in [
+            (None, Some(100)),
+            (Some(200), Some(100)),
+            (Some(50), Some(50)),
+        ] {
+            let request = EvmTransactionRequest {
+                fee_ceiling_wei: requested,
+                ..Default::default()
+            };
+            assert_eq!(
+                EvmTransactionData::for_replacement(&old, &request).fee_ceiling_wei,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn fee_ceiling_checks_legacy_eip1559_and_missing_resolved_fees() {
+        let mut data = EvmTransactionData {
+            fee_ceiling_wei: Some(100),
+            gas_price: Some(100),
+            ..Default::default()
+        };
+        assert!(data.validate_fee_ceiling().is_ok());
+        data.gas_price = Some(101);
+        assert!(data.validate_fee_ceiling().is_err());
+        data.gas_price = None;
+        data.max_fee_per_gas = Some(100);
+        data.max_priority_fee_per_gas = Some(1);
+        assert!(data.validate_fee_ceiling().is_ok());
+        data.max_fee_per_gas = Some(101);
+        assert!(data.validate_fee_ceiling().is_err());
+        data.max_fee_per_gas = None;
+        data.max_priority_fee_per_gas = None;
+        assert!(data.validate_fee_ceiling().is_err());
+        data.fee_ceiling_wei = None;
+        assert!(data.validate_fee_ceiling().is_ok());
+    }
+
+    #[test]
+    fn fee_ceiling_request_accepts_precise_decimal_strings_and_rejects_excess_fees() {
+        let request: EvmTransactionRequest = serde_json::from_value(
+            serde_json::json!({ "value": "0", "gas_price": 101, "fee_ceiling_wei": "100" }),
+        )
+        .unwrap();
+        assert_eq!(request.fee_ceiling_wei, Some(100));
+        assert!(
+            crate::models::evm::validate_price_params(&request, &RelayerRepoModel::default())
+                .is_err()
+        );
     }
 }

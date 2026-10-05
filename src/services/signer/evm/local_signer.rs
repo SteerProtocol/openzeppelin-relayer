@@ -196,6 +196,7 @@ mod tests {
         NetworkTransactionData::Evm(EvmTransactionData {
             from: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
             to: Some("0x742d35Cc6634C0532925a3b844Bc454e4438f44f".to_string()),
+            fee_ceiling_wei: None,
             gas_price: Some(20000000000),
             gas_limit: Some(21000),
             nonce: Some(0),

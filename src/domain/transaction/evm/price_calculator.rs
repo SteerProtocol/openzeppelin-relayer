@@ -232,7 +232,7 @@ where
         let network_gas_prices = self.gas_price_service.get_prices_from_json_rpc().await?;
 
         // For force_bump (noop transactions), skip the gas price cap to ensure bump succeeds
-        let relayer_gas_price_cap = if force_bump {
+        let relayer_gas_price_cap = (if force_bump {
             u128::MAX
         } else {
             relayer
@@ -240,7 +240,8 @@ where
                 .get_evm_policy()
                 .gas_price_cap
                 .unwrap_or(u128::MAX)
-        };
+        })
+        .min(tx_data.fee_ceiling_wei.unwrap_or(u128::MAX));
 
         // Decide EIP1559 vs Legacy based on presence of maxFeePerGas / maxPriorityFeePerGas vs gasPrice
         let bumped_price_params = match (
@@ -1221,6 +1222,44 @@ mod tests {
             assert!(msg.contains("missing required gas price parameters"));
         } else {
             panic!("Expected InvalidType error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fee_ceiling_blocks_minimum_bump_for_legacy_and_eip1559() {
+        for (legacy, cap, allowed) in [
+            (true, 100, false),
+            (false, 100, false),
+            (true, 120, true),
+            (false, 120, true),
+        ] {
+            let mut service = MockEvmGasPriceServiceTrait::new();
+            service
+                .expect_network()
+                .return_const(create_mock_evm_network("mainnet"));
+            service.expect_get_prices_from_json_rpc().returning(|| {
+                Box::pin(async {
+                    Ok(GasPrices {
+                        legacy_prices: SpeedPrices::default(),
+                        max_priority_fee_per_gas: SpeedPrices::default(),
+                        base_fee_per_gas: 1,
+                    })
+                })
+            });
+            let calculator = PriceCalculator::new(service, None);
+            let tx = EvmTransactionData {
+                fee_ceiling_wei: Some(cap),
+                gas_price: if legacy { Some(100) } else { None },
+                max_fee_per_gas: if legacy { None } else { Some(100) },
+                max_priority_fee_per_gas: if legacy { None } else { Some(10) },
+                ..Default::default()
+            };
+            let price = calculator
+                .calculate_bumped_gas_price(&tx, &create_mock_relayer(), false)
+                .await
+                .unwrap();
+            assert_eq!(price.is_min_bumped, Some(allowed));
+            assert!(tx.with_price_params(price).validate_fee_ceiling().is_ok());
         }
     }
 

@@ -501,6 +501,7 @@ mod tests {
     fn test_notification_send_serialization() {
         let payload = WebhookPayload::Transaction(TransactionResponse::Evm(Box::new(
             EvmTransactionResponse {
+                fee_ceiling_wei: None,
                 id: "tx123".to_string(),
                 hash: Some("0x123".to_string()),
                 status: TransactionStatus::Confirmed,
@@ -549,6 +550,7 @@ mod tests {
     fn test_notification_send_serialization_none_values() {
         let payload = WebhookPayload::Transaction(TransactionResponse::Evm(Box::new(
             EvmTransactionResponse {
+                fee_ceiling_wei: None,
                 id: "tx123".to_string(),
                 hash: None,
                 status: TransactionStatus::Confirmed,

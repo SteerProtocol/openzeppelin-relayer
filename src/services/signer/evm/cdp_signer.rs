@@ -277,6 +277,7 @@ mod tests {
         let tx_data = crate::models::EvmTransactionData {
             from: "0x7f5f4552091a69125d5dfcb7b8c2658029395bdf".to_string(),
             to: Some("0x742d35Cc6634C0532925a3b844Bc454e4438f44f".to_string()),
+            fee_ceiling_wei: None,
             gas_price: None,
             gas_limit: Some(21000),
             nonce: Some(0),
@@ -419,6 +420,7 @@ mod tests {
         let tx_data = crate::models::EvmTransactionData {
             from: "0x7f5f4552091a69125d5dfcb7b8c2658029395bdf".to_string(),
             to: Some("0x742d35Cc6634C0532925a3b844Bc454e4438f44f".to_string()),
+            fee_ceiling_wei: None,
             gas_price: Some(20_000_000_000),
             gas_limit: Some(21000),
             nonce: Some(0),
@@ -470,6 +472,7 @@ mod tests {
         let tx_data = crate::models::EvmTransactionData {
             from: "0x7f5f4552091a69125d5dfcb7b8c2658029395bdf".to_string(),
             to: Some("0x742d35Cc6634C0532925a3b844Bc454e4438f44f".to_string()),
+            fee_ceiling_wei: None,
             gas_price: None,
             gas_limit: Some(21000),
             nonce: Some(0),
