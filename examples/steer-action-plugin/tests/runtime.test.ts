@@ -69,7 +69,11 @@ test("actual pooled runtime bundles and invokes plugin over its relayer socket p
             };
           else if (request.method === "sendTransaction") {
             queued.push(request.payload);
-            result = { id: "pooled-tx", relayer_id: "keeper" };
+            result = {
+              id: "pooled-tx",
+              relayer_id: "keeper",
+              fee_ceiling_wei: request.payload.fee_ceiling_wei,
+            };
           } else throw new Error("Unexpected socket method " + request.method);
           socket.write(
             JSON.stringify({ requestId: request.requestId, result }) + "\n",
@@ -108,6 +112,10 @@ test("actual pooled runtime bundles and invokes plugin over its relayer socket p
     assert.equal(result.success, true, JSON.stringify(result.error));
     assert.equal(result.result?.transactionId, "pooled-tx");
     assert.equal(queued.length, 1);
+    assert.equal(
+      (queued[0] as { fee_ceiling_wei: string }).fee_ceiling_wei,
+      "30000000",
+    );
     assert.equal((queued[0] as { data: string }).data, data);
     assert.equal((queued[0] as { gas_limit: number }).gas_limit, 550000);
   } finally {

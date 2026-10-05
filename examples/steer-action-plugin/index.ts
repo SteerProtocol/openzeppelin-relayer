@@ -75,22 +75,35 @@ export async function handler(context: PluginContext) {
   });
   requireFresh(report.snapshot, policy);
   if (action.mode === "estimate") return { mode: "estimate", report };
-  const submissionSnapshot = await verifyBeforeSubmission(rpc, policy, report);
+  const { snapshot: submissionSnapshot, feeCeilingWei } =
+    await verifyBeforeSubmission(rpc, policy, report);
   // A single enqueue attempt. An ambiguous timeout must be reconciled by the
   // processor, never retried automatically here. No wait() inside the plugin.
   if (Date.now() >= deadline)
     throw new Error("Action validation deadline exceeded");
-  const submitted = await relayer.sendTransaction({
+  // SDK 1.10 predates this server extension; a typed variable preserves the
+  // decimal string without changing the SDK's transport or numeric fee fields.
+  const transactionRequest = {
     to: report.transaction.to,
     data: report.transaction.data,
     value: 0,
     gas_limit: report.gasLimit,
     gas_price: Number(report.gasPrice),
+    fee_ceiling_wei: feeCeilingWei,
     valid_until: new Date(
       Date.now() + policy.maxSnapshotAgeSeconds * 1000,
     ).toISOString(),
-  });
+  };
+  const submitted = await relayer.sendTransaction(transactionRequest);
+  if (
+    (submitted as unknown as { fee_ceiling_wei?: string }).fee_ceiling_wei !==
+    feeCeilingWei
+  )
+    throw new Error(
+      "Relayer did not acknowledge stored fee ceiling; reconcile accepted transaction before retrying",
+    );
   return {
+    feeCeilingWei,
     mode: "submit",
     transactionId: submitted.id,
     relayerId: policy.relayerId,

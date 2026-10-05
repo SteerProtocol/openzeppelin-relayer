@@ -15,6 +15,15 @@ address does not approve its implementation.
 
 At the pinned block, the plugin validates Orchestrator/GasVault/registry relationships,
 registered vault identity, strategy ID, fee ceiling, inner gas allowance and funding.
+The persisted action ceiling also includes `GasVault balance / strategy.maxGasPerAction`.
+Before enqueueing, the plugin takes the lower ceiling from the estimation and submission
+snapshots. `fee_ceiling_wei` is an optional decimal-string API extension in this fork,
+not an upstream SDK 1.10 field. Deploy this relayer server change before the plugin;
+the plugin requires the enqueue response to acknowledge the stored ceiling. An absent
+acknowledgement requires reconciliation because the transaction might already exist.
+Upgrade every API and transaction worker before enabling guarded submissions. Older
+workers can ignore the field; drain or reconcile capped pending actions before downgrading
+the server.
 The effective fee ceiling is the minimum of operator, strategy and relayer caps when the
 relayer exposes one. The fee-dependent GasVault getter is also checked from the keeper.
 A vault state is reported, rather than used as an invented blanket eligibility rule.
@@ -152,9 +161,14 @@ result; increasing gas does not repair an invalid swap. Archive availability is 
 
 - Simulation does not guarantee future mining success. State, queue delay and fee replacement
   can change. This is an explicit endpoint, not a replacement/signing lifecycle hook.
-- Relayer replacement fees are not revalidated here. Validate native transaction type, relayer
-  fee caps and replacement behavior for each chain before enabling. No EIP-1559 expansion is
-  included in this change.
+- The relayer persists the action ceiling and checks final fees before initial signing,
+  automatic resubmission and manual replacement. Replacement requests cannot remove or
+  raise it. A minimum bump above the ceiling leaves the original pending for monitoring
+  and existing expiry/cancellation. NOOP cancellation clears this action ceiling.
+- This ceiling is a snapshot, not a reservation of GasVault funds. Later funding, strategy,
+  votes or vault-state changes can still prevent mining success. There is no lifecycle
+  re-simulation hook. Validate native transaction type and replacement behavior for each
+  chain before enabling. No EIP-1559 plugin fee mode is added in this change.
 - Guard overhead and access warming can shift estimates. Verify original-call completion and
   validate margins across representative actions. Gas search need not find a mathematical
   minimum for gas-dependent contracts; only a verified bounded candidate is accepted.

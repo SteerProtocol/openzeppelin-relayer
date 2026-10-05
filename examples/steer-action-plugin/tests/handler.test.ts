@@ -24,7 +24,10 @@ function context(
     }),
     sendTransaction: async (p: unknown) => {
       sent.push(p);
-      return { id: "tx-123" };
+      return {
+        id: "tx-123",
+        fee_ceiling_wei: (p as { fee_ceiling_wei: string }).fee_ceiling_wei,
+      };
     },
   };
   const ctx = {
@@ -64,6 +67,7 @@ test("submit queues original payload once with checked gas and initial fee", asy
     value: 0,
     gas_limit: 550000,
     gas_price: 25000000,
+    fee_ceiling_wei: "30000000",
   });
   assert.equal(sent.length, 1);
   assert.equal(
@@ -205,4 +209,14 @@ test("concurrent requests retain independent relayer selection and submit flags"
   assert.equal(results[1].status, "rejected");
   assert.equal(first.sent.length, 1);
   assert.equal(second.sent.length, 0);
+});
+
+test("a server that does not acknowledge the ceiling requires reconciliation without retry", async () => {
+  const c = context("submit");
+  c.relayer.sendTransaction = async (p: unknown) => {
+    c.sent.push(p);
+    return { id: "tx-123" } as any;
+  };
+  await assert.rejects(handler(c.ctx), /reconcile accepted transaction/);
+  assert.equal(c.sent.length, 1);
 });

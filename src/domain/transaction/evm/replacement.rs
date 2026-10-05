@@ -424,6 +424,7 @@ mod tests {
 
     fn create_legacy_transaction_data() -> EvmTransactionData {
         EvmTransactionData {
+            fee_ceiling_wei: None,
             gas_price: Some(20_000_000_000), // 20 gwei
             gas_limit: Some(21000),
             nonce: Some(1),
@@ -443,6 +444,7 @@ mod tests {
 
     fn create_eip1559_transaction_data() -> EvmTransactionData {
         EvmTransactionData {
+            fee_ceiling_wei: None,
             gas_price: None,
             gas_limit: Some(21000),
             nonce: Some(1),

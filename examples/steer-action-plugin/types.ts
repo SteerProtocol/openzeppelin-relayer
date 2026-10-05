@@ -12,6 +12,7 @@ export interface ActionMetadata {
   innerGasAllowance: string;
   strategyGasPriceCap: string;
   effectiveGasPriceCap: string;
+  feeCeilingWei: string;
   gasBalance: string;
 }
 export type Rpc = (method: string, params: unknown[]) => Promise<unknown>;

@@ -157,6 +157,9 @@ export async function readActionMetadata(
   )[0] as bigint;
   if (balance < fee * strategy.maxGasPerAction)
     throw new ActionError("POLICY_VIOLATION", "Insufficient GasVault funding");
+  const fundingCap = balance / strategy.maxGasPerAction;
+  const feeCeilingWei =
+    effectiveGasPriceCap < fundingCap ? effectiveGasPriceCap : fundingCap;
   // The live getter is authoritative about fee-dependent execution eligibility.
   const allowance = (
     await readCore(
@@ -183,5 +186,6 @@ export async function readActionMetadata(
     strategyGasPriceCap: strategy.maxGasCost.toString(),
     effectiveGasPriceCap: effectiveGasPriceCap.toString(),
     gasBalance: balance.toString(),
+    feeCeilingWei: feeCeilingWei.toString(),
   };
 }

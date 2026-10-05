@@ -135,6 +135,7 @@ mod tests {
             value: U256::from(1_000_000_000_000_000_000u128), // 1 ETH
             data: Some("0x1234567890abcdef".to_string()),     // 8 bytes of data
             gas_limit: Some(21000),
+            fee_ceiling_wei: None,
             gas_price: Some(20_000_000_000), // 20 Gwei
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
@@ -196,6 +197,7 @@ mod tests {
             value: U256::from(1_000_000_000_000_000_000u128), // 1 ETH
             data: Some("0x1234567890abcdef".to_string()),     // 8 bytes of data
             gas_limit: Some(21000),
+            fee_ceiling_wei: None,
             gas_price: None,
             max_fee_per_gas: Some(30_000_000_000), // 30 Gwei
             max_priority_fee_per_gas: Some(2_000_000_000), // 2 Gwei
@@ -258,6 +260,7 @@ mod tests {
             value: U256::from(1_000_000_000_000_000_000u128),
             data: None,
             gas_limit: Some(21000),
+            fee_ceiling_wei: None,
             gas_price: Some(15_000_000_000), // Lower than zkEVM estimate
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
@@ -354,6 +357,7 @@ mod tests {
             value: U256::from(1_000_000_000_000_000_000u128),
             data: Some("0x1234".to_string()),
             gas_limit: Some(21000),
+            fee_ceiling_wei: None,
             gas_price: None, // No gas price set
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
@@ -410,6 +414,7 @@ mod tests {
             value: U256::from(1_000_000_000_000_000_000u128),
             data: Some("0x1234".to_string()),
             gas_limit: Some(21000),
+            fee_ceiling_wei: None,
             gas_price: Some(15_000_000_000), // 15 Gwei
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
@@ -474,6 +479,7 @@ mod tests {
             value: U256::from(1_000_000_000_000_000_000u128),
             data: Some("0x1234".to_string()),
             gas_limit: Some(21000),
+            fee_ceiling_wei: None,
             gas_price: Some(15_000_000_000),
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
@@ -523,6 +529,7 @@ mod tests {
             value: U256::from(1000000000000000000u64), // 1 ETH
             data: Some("0x1234567890abcdef".to_string()),
             gas_limit: Some(21000),
+            fee_ceiling_wei: None,
             gas_price: Some(20000000000),               // 20 Gwei
             max_fee_per_gas: Some(30000000000),         // 30 Gwei
             max_priority_fee_per_gas: Some(2000000000), // 2 Gwei
@@ -553,6 +560,7 @@ mod tests {
             value: U256::ZERO,
             data: None,
             gas_limit: None,
+            fee_ceiling_wei: None,
             gas_price: None,
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
@@ -588,6 +596,7 @@ mod tests {
             value: U256::ZERO,
             data: Some("abcdef1234".to_string()), // No 0x prefix
             gas_limit: None,
+            fee_ceiling_wei: None,
             gas_price: None,
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,

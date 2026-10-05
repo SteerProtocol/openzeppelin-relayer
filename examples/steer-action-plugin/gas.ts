@@ -344,7 +344,7 @@ export async function verifyBeforeSubmission(
   rpc: Rpc,
   policy: Policy,
   report: GasReport,
-): Promise<Snapshot> {
+): Promise<{ snapshot: Snapshot; feeCeilingWei: string }> {
   policy = parsePolicy(policy);
   if (!policy.submitEnabled)
     throw new ActionError("CHAIN_DISABLED", "Submission is disabled");
@@ -353,7 +353,7 @@ export async function verifyBeforeSubmission(
   const snapshot = await readSnapshot(rpc);
   requireFresh(snapshot, policy);
   await checkDeployment(rpc, policy, snapshot);
-  await readActionMetadata(
+  const metadata = await readActionMetadata(
     rpc,
     policy,
     snapshot,
@@ -373,5 +373,9 @@ export async function verifyBeforeSubmission(
   );
   await checkCanonical(rpc, snapshot);
   requireFresh(snapshot, policy);
-  return snapshot;
+  const feeCeilingWei =
+    BigInt(metadata.feeCeilingWei) < BigInt(report.metadata.feeCeilingWei)
+      ? metadata.feeCeilingWei
+      : report.metadata.feeCeilingWei;
+  return { snapshot, feeCeilingWei };
 }

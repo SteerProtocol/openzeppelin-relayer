@@ -271,3 +271,33 @@ test("fresh pre-submission reads catch changed strategy limits and reject stale 
     /stale/,
   );
 });
+
+test("funding fee ceiling uses inner allowance and submission preserves the lower snapshot ceiling", async () => {
+  const funding = (balance: bigint) =>
+    mockRpc((m, p) =>
+      m === "eth_call" &&
+      (p[0] as { data: string }).data.startsWith(
+        CORE_ABIS.GasVault.getFunction("ethBalances")!.selector,
+      )
+        ? CORE_ABIS.GasVault.encodeFunctionResult("ethBalances", [balance])
+        : undefined,
+    ).rpc;
+  const report = await estimateAction(
+    funding(13000000000000n),
+    policy,
+    { data, mode: "estimate" },
+    from,
+  );
+  assert.equal(report.metadata.feeCeilingWei, "26000000");
+  assert.equal(report.metadata.effectiveGasPriceCap, "30000000");
+  assert.equal(
+    (await verifyBeforeSubmission(funding(14000000000000n), policy, report))
+      .feeCeilingWei,
+    "26000000",
+  );
+  assert.equal(
+    (await verifyBeforeSubmission(funding(12500000000000n), policy, report))
+      .feeCeilingWei,
+    "25000000",
+  );
+});

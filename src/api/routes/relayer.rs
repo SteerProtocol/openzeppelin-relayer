@@ -346,6 +346,7 @@ mod tests {
             confirmed_at: None,
             valid_until: None,
             network_data: NetworkTransactionData::Evm(EvmTransactionData {
+                fee_ceiling_wei: None,
                 gas_price: Some(20000000000u128),
                 gas_limit: Some(21000u64),
                 nonce: Some(1u64),

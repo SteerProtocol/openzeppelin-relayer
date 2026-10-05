@@ -2722,6 +2722,7 @@ mod tests {
             priced_at: None,
             hashes: vec![],
             network_data: NetworkTransactionData::Evm(EvmTransactionData {
+                fee_ceiling_wei: None,
                 gas_price: Some(1000000000),
                 gas_limit: Some(21000),
                 nonce: Some(1),
@@ -4082,6 +4083,7 @@ mod tests {
         repo.create(tx).await.unwrap();
 
         let new_network_data = NetworkTransactionData::Evm(EvmTransactionData {
+            fee_ceiling_wei: None,
             gas_price: Some(2000000000),
             gas_limit: Some(42000),
             nonce: Some(2),

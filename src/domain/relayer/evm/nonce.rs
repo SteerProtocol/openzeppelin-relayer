@@ -450,6 +450,7 @@ where
         let evm_network = EvmNetwork::try_from(network_model.clone())?;
 
         let mut evm_data = EvmTransactionData {
+            fee_ceiling_wei: None,
             gas_price: None,
             gas_limit: None,
             nonce: None,

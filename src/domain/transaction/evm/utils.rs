@@ -20,6 +20,8 @@ pub async fn make_noop<P: EvmProviderTrait>(
     provider: Option<&P>,
 ) -> Result<(), TransactionError> {
     // Update the transaction to be a noop
+    // Cancellation consumes the nonce without executing the action or its GasVault guard.
+    evm_data.fee_ceiling_wei = None;
     evm_data.value = U256::from(0u64);
     evm_data.data = Some("0x".to_string());
     evm_data.to = Some(evm_data.from.clone());
@@ -282,13 +284,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_make_noop_standard_network() {
+    async fn test_fee_ceiling_make_noop_standard_network() {
         let mut evm_data = EvmTransactionData {
             from: "0x1234567890123456789012345678901234567890".to_string(),
             to: Some("0xoriginal_destination".to_string()),
             value: U256::from(1000000000000000000u64), // 1 ETH
             data: Some("0xoriginal_data".to_string()),
             gas_limit: Some(50000),
+            fee_ceiling_wei: Some(1),
             gas_price: Some(10_000_000_000),
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
@@ -304,6 +307,7 @@ mod tests {
         let result = make_noop(&mut evm_data, &network, None::<&MockEvmProviderTrait>).await;
         assert!(result.is_ok());
 
+        assert_eq!(evm_data.fee_ceiling_wei, None);
         // Verify the transaction was updated correctly
         assert_eq!(evm_data.gas_limit, Some(21_000)); // Standard gas limit
         assert_eq!(evm_data.to.unwrap(), evm_data.from); // Should send to self
@@ -321,6 +325,7 @@ mod tests {
             value: U256::from(1000000000000000000u64), // 1 ETH
             data: Some("0xoriginal_data".to_string()),
             gas_limit: Some(50000),
+            fee_ceiling_wei: None,
             gas_price: Some(10_000_000_000),
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
@@ -353,6 +358,7 @@ mod tests {
             value: U256::from(1000000000000000000u64), // 1 ETH
             data: Some("0xoriginal_data".to_string()),
             gas_limit: Some(30000),
+            fee_ceiling_wei: None,
             gas_price: Some(10_000_000_000),
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
@@ -393,6 +399,7 @@ mod tests {
             value: U256::from(1000000000000000000u64), // 1 ETH
             data: Some("0xoriginal_data".to_string()),
             gas_limit: Some(30000),
+            fee_ceiling_wei: None,
             gas_price: Some(10_000_000_000),
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
@@ -432,6 +439,7 @@ mod tests {
             value: U256::from(1000000000000000000u64), // 1 ETH
             data: Some("0xoriginal_data".to_string()),
             gas_limit: Some(30000),
+            fee_ceiling_wei: None,
             gas_price: Some(10_000_000_000),
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
@@ -465,6 +473,7 @@ mod tests {
             value: U256::from(0u64),
             data: Some("0x".to_string()),
             gas_limit: Some(21000),
+            fee_ceiling_wei: None,
             gas_price: Some(10_000_000_000),
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
@@ -513,6 +522,7 @@ mod tests {
                 value: U256::from(0u64),
                 data: Some("0x".to_string()),
                 gas_limit: Some(21000),
+                fee_ceiling_wei: None,
                 gas_price: Some(10_000_000_000),
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
@@ -561,6 +571,7 @@ mod tests {
                 value: U256::from(0u64),
                 data: Some("0x".to_string()),
                 gas_limit: Some(21000),
+                fee_ceiling_wei: None,
                 gas_price: Some(10_000_000_000),
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
