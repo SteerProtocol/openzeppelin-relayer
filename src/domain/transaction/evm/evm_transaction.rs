@@ -1850,16 +1850,13 @@ mod tests {
             evm_data.gas_limit = None;
         }
 
-        mock_provider
-            .expect_estimate_gas()
-            .times(1)
-            .returning(|_| {
-                Box::pin(async {
-                    Err(crate::services::provider::ProviderError::Other(
-                        "execution reverted".to_string(),
-                    ))
-                })
-            });
+        mock_provider.expect_estimate_gas().times(1).returning(|_| {
+            Box::pin(async {
+                Err(crate::services::provider::ProviderError::Other(
+                    "execution reverted".to_string(),
+                ))
+            })
+        });
 
         let original_tx = test_tx.clone();
         mock_transaction
@@ -1902,7 +1899,10 @@ mod tests {
             signer: mock_signer,
         };
 
-        let prepared = relayer_transaction.prepare_transaction(test_tx).await.unwrap();
+        let prepared = relayer_transaction
+            .prepare_transaction(test_tx)
+            .await
+            .unwrap();
         assert_eq!(prepared.status, TransactionStatus::Failed);
         assert!(prepared
             .status_reason
