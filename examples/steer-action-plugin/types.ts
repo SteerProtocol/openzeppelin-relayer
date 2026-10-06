@@ -41,6 +41,7 @@ export interface Action {
   mode: "estimate" | "submit";
 }
 export interface Snapshot {
+  baseFeePerGas?: string;
   number: string;
   hash: string;
   gasLimit: string;
@@ -62,6 +63,13 @@ export interface GasReport {
   relayerFeeCap?: string;
   snapshot: Snapshot;
   implementation: string;
+  gasPolicy?: {
+    policyVersion: string;
+    hardMaxGas: number;
+    effectiveMaxGas: number;
+    marginBps: number;
+    capUtilizationBps: number;
+  };
   guardedEstimate: number;
   gasLimit: number;
   gasPrice: string;

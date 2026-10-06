@@ -44,7 +44,7 @@ use crate::{
         provider::{EvmProvider, EvmProviderTrait},
         signer::{EvmSigner, Signer},
     },
-    utils::{calculate_scheduled_timestamp, get_evm_default_gas_limit_for_tx},
+    utils::calculate_scheduled_timestamp,
 };
 
 use super::PriceParams;
@@ -690,14 +690,14 @@ where
                         error = ?estimation_error,
                         "failed to estimate gas limit"
                     );
-
-                    let default_gas_limit = get_evm_default_gas_limit_for_tx(&evm_data);
-                    debug!(
-                        tx_id = %tx.id,
-                        gas_limit = %default_gas_limit,
-                        "fallback to default gas limit"
-                    );
-                    evm_data.gas_limit = Some(default_gas_limit);
+                    // No nonce, signature, or submit job may follow a failed estimate.
+                    return self
+                        .mark_transaction_as_failed(
+                            &tx,
+                            estimation_error.to_string(),
+                            "gas estimation failed",
+                        )
+                        .await;
                 }
             }
         } else {
@@ -1832,6 +1832,82 @@ mod tests {
         let prepared_tx = result.unwrap();
         assert_eq!(prepared_tx.status, TransactionStatus::Sent);
         assert!(!prepared_tx.hashes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_transaction_does_not_submit_after_gas_estimation_failure() {
+        let mut mock_transaction = MockTransactionRepository::new();
+        let mock_relayer = MockRelayerRepository::new();
+        let mut mock_provider = MockEvmProviderTrait::new();
+        let mut mock_signer = MockSigner::new();
+        let mut mock_job_producer = MockJobProducerTrait::new();
+        let mock_price_calculator = MockPriceCalculator::new();
+        let mut counter_service = MockTransactionCounterTrait::new();
+        let mock_network = MockNetworkRepository::new();
+
+        let mut test_tx = create_test_transaction();
+        if let NetworkTransactionData::Evm(ref mut evm_data) = test_tx.network_data {
+            evm_data.gas_limit = None;
+        }
+
+        mock_provider.expect_estimate_gas().times(1).returning(|_| {
+            Box::pin(async {
+                Err(crate::services::provider::ProviderError::Other(
+                    "execution reverted".to_string(),
+                ))
+            })
+        });
+
+        let original_tx = test_tx.clone();
+        mock_transaction
+            .expect_partial_update()
+            .times(1)
+            .withf(|id, update| {
+                id == "test-tx-id"
+                    && update.status == Some(TransactionStatus::Failed)
+                    && update
+                        .status_reason
+                        .as_ref()
+                        .is_some_and(|reason| reason.contains("Failed to estimate gas"))
+            })
+            .returning(move |_, update| {
+                let mut failed_tx = original_tx.clone();
+                failed_tx.status = update.status.unwrap();
+                failed_tx.status_reason = update.status_reason;
+                Ok(failed_tx)
+            });
+
+        counter_service.expect_get_and_increment().times(0);
+        mock_signer.expect_sign_transaction().times(0);
+        mock_job_producer
+            .expect_produce_submit_transaction_job()
+            .times(0);
+        mock_job_producer
+            .expect_produce_send_notification_job()
+            .times(1)
+            .returning(|_, _| Box::pin(ready(Ok(()))));
+
+        let relayer_transaction = EvmRelayerTransaction {
+            relayer: create_test_relayer(),
+            provider: mock_provider,
+            relayer_repository: Arc::new(mock_relayer),
+            network_repository: Arc::new(mock_network),
+            transaction_repository: Arc::new(mock_transaction),
+            transaction_counter_service: Arc::new(counter_service),
+            job_producer: Arc::new(mock_job_producer),
+            price_calculator: mock_price_calculator,
+            signer: mock_signer,
+        };
+
+        let prepared = relayer_transaction
+            .prepare_transaction(test_tx)
+            .await
+            .unwrap();
+        assert_eq!(prepared.status, TransactionStatus::Failed);
+        assert!(prepared
+            .status_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Failed to estimate gas")));
     }
 
     #[tokio::test]

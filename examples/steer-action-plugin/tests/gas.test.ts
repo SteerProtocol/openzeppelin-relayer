@@ -231,3 +231,143 @@ test("oversized provider estimate never causes an over-cap simulation", async ()
     );
   }
 });
+
+test("oracle quote below the snapshot base fee uses the base fee without a gas buffer", async () => {
+  const base = mockRpc();
+  const calls: { method: string; params: unknown[] }[] = [];
+  const rpc: Rpc = async (method, params) => {
+    calls.push({ method, params });
+    const value = await base.rpc(method, params);
+    if (method === "eth_getBlockByNumber")
+      return { ...(value as object), baseFeePerGas: "0x1338e60" }; // 20,156,000 wei
+    if (method === "eth_gasPrice") return "0x1312d00"; // 20,000,000 wei
+    return value;
+  };
+  const report = await estimateAction(
+    rpc,
+    policy,
+    { data, mode: "estimate" },
+    from,
+  );
+  assert.equal(report.gasPrice, String(BigInt("0x1338e60")));
+  assert.equal(report.gasLimit, 550000);
+  for (const call of calls.filter((c) => c.method === "eth_call")) {
+    const tx = call.params[0] as { gasPrice?: string };
+    if (tx.gasPrice) assert.ok(BigInt(tx.gasPrice) >= BigInt("0x1338e60"));
+  }
+});
+
+test("a rising base fee rejects stale submission pricing before simulation or enqueue", async () => {
+  const report = await estimateAction(
+    mockRpc().rpc,
+    policy,
+    { data, mode: "estimate" },
+    from,
+  );
+  const base = mockRpc();
+  let pricedCalls = 0;
+  const rpc: Rpc = async (method, params) => {
+    if (method === "eth_call" && (params[0] as { gasPrice?: string }).gasPrice)
+      pricedCalls++;
+    const value = await base.rpc(method, params);
+    if (method === "eth_getBlockByNumber")
+      return { ...(value as object), baseFeePerGas: "0x1c9c380" }; // 30,000,000 > selected 25,000,000
+    return value;
+  };
+  await assert.rejects(
+    verifyBeforeSubmission(rpc, policy, report),
+    /FEE_BELOW_BASE_FEE/,
+  );
+  assert.equal(pricedCalls, 0);
+});
+
+test("over-cap guarded gas errors retain the required estimate and limit", async () => {
+  const { rpc } = mockRpc((method, params) => {
+    const overrides = params[2] as Record<string, { code: string }> | undefined;
+    if (
+      method === "eth_estimateGas" &&
+      overrides?.[proxy]?.code !== "0x60006000fd"
+    )
+      return "0x" + (968602).toString(16);
+    return undefined;
+  });
+  await assert.rejects(
+    estimateAction(rpc, policy, { data, mode: "estimate" }, from),
+    /GAS_LIMIT_CAP_EXCEEDED.*968602.*1065463.*1000000/,
+  );
+});
+
+test("fresh strategy allowance changes invalidate an estimated report", async () => {
+  const report = await estimateAction(
+    mockRpc().rpc,
+    policy,
+    { data, mode: "estimate" },
+    from,
+  );
+  const changed = {
+    ...report,
+    metadata: { ...report.metadata, innerGasAllowance: "499999" },
+  };
+  await assert.rejects(
+    verifyBeforeSubmission(mockRpc().rpc, policy, changed),
+    /STRATEGY_GAS_POLICY_CHANGED/,
+  );
+  await assert.rejects(
+    verifyBeforeSubmission(
+      mockRpc().rpc,
+      { ...policy, maxGas: 540000 },
+      report,
+    ),
+    /cap/,
+  );
+});
+
+test("near-cap telemetry preserves the estimated limit instead of allocating the maximum", async () => {
+  const logs: string[] = [];
+  const original = console.info;
+  console.info = (message) => logs.push(message);
+  try {
+    const report = await estimateAction(
+      mockRpc().rpc,
+      { ...policy, maxGas: 600000 },
+      { data, mode: "estimate" },
+      from,
+    );
+    assert.equal(report.gasLimit, 550000);
+    assert.equal(report.gasPolicy!.capUtilizationBps, 9167);
+    assert.equal(JSON.parse(logs[0]).event, "steer_gas_near_cap");
+    assert.equal(JSON.parse(logs[0]).hardMaxGas, 600000);
+  } finally {
+    console.info = original;
+  }
+});
+
+test("telemetry action hashes use canonical full-call or time-independent prefixes", async () => {
+  const { actionHashFor } = await import("../gas");
+  const { AbiCoder, keccak256 } = await import("ethers");
+  assert.equal(
+    actionHashFor(data),
+    keccak256(
+      AbiCoder.defaultAbiCoder().encode(
+        ["address", "uint256", "bytes[]"],
+        [target, 1, ["0x1234"]],
+      ),
+    ),
+  );
+  const prefixed = ACTION_ABI.encodeFunctionData("executeAction", [
+    target,
+    1,
+    ["0x1234"],
+    [1],
+    "0x" + "00".repeat(32),
+  ]);
+  assert.equal(
+    actionHashFor(prefixed),
+    keccak256(
+      AbiCoder.defaultAbiCoder().encode(
+        ["address", "uint256", "bytes[]", "string"],
+        [target, 1, ["0x12"], "$$"],
+      ),
+    ),
+  );
+});

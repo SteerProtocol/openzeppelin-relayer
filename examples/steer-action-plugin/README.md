@@ -183,3 +183,63 @@ result; increasing gas does not repair an invalid swap. Archive availability is 
 `config.ts` resolves the trusted chain policy and approved keeper. `types.ts` holds shared execution types. `validation.ts` holds input validators. `index.ts` orchestrates one request; `metadata.ts` and `gas.ts` remain the single metadata and simulation implementations. No mutable simulation state is shared across invocations.
 
 A shared endpoint changes IAM route granularity: permission to call it reaches every configured keeper unless the authenticated gateway enforces a caller-to-relayer allowlist. The plugin context does not provide an authenticated IAM principal. The chain map is an operator allowlist, not caller authorization. Before rollout, either verify that callers are authorized for every configured keeper, or enforce the authenticated principal's permitted `params.relayerId` at the trusted proxy. Never derive that principal from request body fields. Route-level IAM alone cannot preserve previous per-keeper isolation on a shared route.
+
+### Simulation fee floor
+
+`eth_gasPrice` can quote a newer block whose fee is lower than the pinned simulation
+block's base fee. Default pricing uses the greater of the oracle quote and the
+snapshot base fee, still subject to operator, strategy, relayer and GasVault caps.
+This changes the price per gas, not the gas limit, and adds no gas buffer. A pinned
+explicit price below that floor is rejected. A base-fee increase between estimation
+and the fresh submission snapshot returns `FEE_BELOW_BASE_FEE` before enqueue; it
+never changes the accepted transaction's pricing silently or retries submission.
+
+`GAS_LIMIT_CAP_EXCEEDED` includes the guarded estimate, required limit with the
+configured plugin margin and enforced ceiling. Do not remove caps or margins just
+to turn validation green; evaluate the action and operator policy first.
+
+### Gas policy telemetry and cap rejections
+
+`maxGas` is the hard outer operator maximum, not the gas allocated to every action.
+The plugin still uses `ceil(completedEstimate * (10000 + marginBps) / 10000)` and
+never clamps a required limit down to the cap. Inner strategy/GasVault allowance
+is validated independently and is not copied to the outer limit.
+
+Completed estimates log a versioned JSON outcome with chain/keeper/strategy,
+action hash, snapshot, inner allowance, raw estimate, required limit, hard and
+block-bounded maxima, margin and cap utilization. The policy version is a hash
+of normalized operator settings. Event names are `steer_gas_estimated`,
+`steer_gas_near_cap` (at least 80%) and `steer_gas_cap_exceeded`. No provider URLs,
+keys or calldata are included. Estimate-only requests also produce these events;
+they measure policy pressure, not accepted or mined transactions.
+
+A cap rejection before enqueue returns successful transport data containing:
+
+```json
+{
+  "schemaVersion": 1,
+  "mode": "rejected",
+  "relayerId": "arbitrum-node-1",
+  "stage": "validation",
+  "enqueueAttempted": false,
+  "requiresReconciliation": false,
+  "error": {
+    "code": "GAS_LIMIT_CAP_EXCEEDED",
+    "message": "GAS_LIMIT_CAP_EXCEEDED: ...",
+    "details": {
+      "relayerId": "arbitrum-node-1",
+      "guardedEstimate": 1107592,
+      "requiredGasLimit": 1218352,
+      "effectiveMaxGas": 1200000
+    }
+  }
+}
+```
+
+Details also carry the telemetry fields above. A transport-success envelope is
+not submission success: callers must distinguish `mode: rejected` from `submit`.
+Only this validated response establishes non-enqueue. Generic HTTP failures,
+timeouts and errors after the single enqueue attempt remain ambiguous and must
+be reconciled. Deploy compatible processor handling before this plugin change.
+No automatic retry, signer fallback, unbounded cap increase or history store is
+introduced. Fresh strategy-ID or inner-allowance changes invalidate the report.

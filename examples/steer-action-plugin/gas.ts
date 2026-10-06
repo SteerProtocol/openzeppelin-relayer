@@ -1,4 +1,11 @@
-import { getAddress, keccak256, toQuantity } from "ethers";
+import {
+  AbiCoder,
+  dataSlice,
+  getAddress,
+  keccak256,
+  toUtf8Bytes,
+  toQuantity,
+} from "ethers";
 import guard from "./guard-runtime.json";
 
 import type {
@@ -30,6 +37,29 @@ import {
   SDK_VERSION,
 } from "./metadata";
 import { ActionError, ExecutionReverted, withinDeadline } from "./errors";
+
+export function actionHashFor(data: string): string {
+  const args = ACTION_ABI.decodeFunctionData("executeAction", data);
+  const calls: string[] = args[2];
+  const lengths: bigint[] = args[3];
+  if (lengths.length > calls.length)
+    throw new Error("Invalid action prefix lengths");
+  const prefixes = lengths.map((length, i) => {
+    if (length < 0n || length > BigInt((calls[i].length - 2) / 2))
+      throw new Error("Invalid action prefix length");
+    return dataSlice(calls[i], 0, Number(length));
+  });
+  return keccak256(
+    AbiCoder.defaultAbiCoder().encode(
+      lengths.length
+        ? ["address", "uint256", "bytes[]", "string"]
+        : ["address", "uint256", "bytes[]"],
+      lengths.length
+        ? [args[0], args[1], prefixes, "$$"]
+        : [args[0], args[1], calls],
+    ),
+  );
+}
 
 const IMPLEMENTATION_SLOT =
   "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
@@ -80,7 +110,21 @@ export async function readSnapshot(
     hash: hash(b.hash, "block hash"),
     gasLimit: toQuantity(quantity(b.gasLimit, "block gas limit")),
     timestamp: toQuantity(quantity(b.timestamp, "block timestamp")),
+    ...(b.baseFeePerGas === undefined
+      ? {}
+      : {
+          baseFeePerGas: toQuantity(
+            quantity(b.baseFeePerGas, "block base fee"),
+          ),
+        }),
   };
+}
+function requireBaseFee(gasPrice: bigint, snapshot: Snapshot): void {
+  if (gasPrice < BigInt(snapshot.baseFeePerGas ?? "0x0"))
+    throw new ActionError(
+      "FEE_BELOW_BASE_FEE",
+      "Selected gas price is below the simulation block base fee; re-estimate before submitting",
+    );
 }
 export function requireFresh(snapshot: Snapshot, policy: Policy): void {
   const age =
@@ -206,10 +250,20 @@ export async function estimateAction(
     ) !== 0n
   )
     throw new Error("Simulation code-copy address is occupied");
-  const gasPrice =
+  const quotedGasPrice =
     options.gasPrice === undefined
       ? quantity(await rpc("eth_gasPrice", []), "gas price")
       : BigInt(decimal(options.gasPrice, "gasPrice"));
+  if (quotedGasPrice <= 0n)
+    throw new Error("Gas price exceeds configured cap or is zero");
+  const baseFee = BigInt(snapshot.baseFeePerGas ?? "0x0");
+  // The oracle may quote a newer, cheaper block than the pinned snapshot.
+  // Use the snapshot's fee floor without changing gas limits or adding a buffer.
+  const gasPrice =
+    options.gasPrice === undefined && quotedGasPrice < baseFee
+      ? baseFee
+      : quotedGasPrice;
+  requireBaseFee(gasPrice, snapshot);
   if (gasPrice <= 0n || gasPrice > BigInt(policy.maxGasPrice))
     throw new Error("Gas price exceeds configured cap or is zero");
   const ceiling =
@@ -306,10 +360,42 @@ export async function estimateAction(
   }
   async function finish(estimate: bigint): Promise<GasReport> {
     const gas = (estimate * BigInt(10000 + policy.marginBps) + 9999n) / 10000n;
-    if (estimate < 21000n || gas > ceiling)
-      throw new Error(
-        "Guarded estimate plus margin exceeds configured/block gas cap",
+    const gasPolicy = {
+      policyVersion: keccak256(toUtf8Bytes(JSON.stringify(policy))),
+      hardMaxGas: policy.maxGas,
+      effectiveMaxGas: Number(ceiling),
+      marginBps: policy.marginBps,
+      capUtilizationBps: Number((gas * 10000n + ceiling - 1n) / ceiling),
+    };
+    const telemetry = {
+      schemaVersion: 1,
+      chainId: policy.chainId,
+      relayerId: policy.relayerId,
+      strategyId: metadata.strategyId,
+      vaultAddress: metadata.target,
+      actionHash: actionHashFor(action.data),
+      calldataHash: keccak256(action.data),
+      snapshotBlock: snapshot.number,
+      innerGasAllowance: metadata.innerGasAllowance,
+      guardedEstimate: Number(estimate),
+      requiredGasLimit: Number(gas),
+      ...gasPolicy,
+    };
+    if (estimate < 21000n || gas > ceiling) {
+      console.warn(
+        JSON.stringify({
+          event: "steer_gas_cap_exceeded",
+          ...telemetry,
+          code: "GAS_LIMIT_CAP_EXCEEDED",
+          enqueueAttempted: false,
+        }),
       );
+      throw new ActionError(
+        "GAS_LIMIT_CAP_EXCEEDED",
+        `Guarded estimate ${estimate} plus configured margin requires ${gas} gas, above gas cap ${ceiling}`,
+        telemetry,
+      );
+    }
     requireCompleted(
       await rpc("eth_call", [
         { ...transaction, gas: toQuantity(estimate) },
@@ -324,7 +410,18 @@ export async function estimateAction(
       ]),
     );
     await checkCanonical(rpc, snapshot);
+    console.info(
+      JSON.stringify({
+        event:
+          gasPolicy.capUtilizationBps >= 8000
+            ? "steer_gas_near_cap"
+            : "steer_gas_estimated",
+        ...telemetry,
+        enqueueAttempted: false,
+      }),
+    );
     return {
+      gasPolicy,
       chainId: policy.chainId,
       profileId: policy.profile.id,
       backend: policy.profile.backend,
@@ -353,6 +450,7 @@ export async function verifyBeforeSubmission(
   const snapshot = await readSnapshot(rpc);
   requireFresh(snapshot, policy);
   await checkDeployment(rpc, policy, snapshot);
+  requireBaseFee(BigInt(report.gasPrice), snapshot);
   const metadata = await readActionMetadata(
     rpc,
     policy,
@@ -360,7 +458,19 @@ export async function verifyBeforeSubmission(
     report.transaction,
     report.relayerFeeCap,
   );
-  if (BigInt(report.gasLimit) > BigInt(snapshot.gasLimit))
+  if (
+    metadata.strategyId !== report.metadata.strategyId ||
+    metadata.innerGasAllowance !== report.metadata.innerGasAllowance
+  ) {
+    throw new ActionError(
+      "STRATEGY_GAS_POLICY_CHANGED",
+      "Strategy allowance changed after estimation; obtain a new estimate",
+    );
+  }
+  if (
+    BigInt(report.gasLimit) > BigInt(policy.maxGas) ||
+    BigInt(report.gasLimit) > BigInt(snapshot.gasLimit)
+  )
     throw new ActionError(
       "POLICY_VIOLATION",
       "Gas limit exceeds current block cap",

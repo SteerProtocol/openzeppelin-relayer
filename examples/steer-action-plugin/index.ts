@@ -44,7 +44,10 @@ export function relayerRpc(
 }
 
 /** Explicit endpoint, not a relayer lifecycle hook. POST only, fail closed. */
-export async function handler(context: PluginContext) {
+async function execute(
+  context: PluginContext,
+  state: { enqueueAttempted: boolean },
+) {
   if (context.method !== "POST") throw new Error("Only POST is accepted");
   const request = parseRequest(context.params);
   const policy = resolvePolicy(context.config, request.relayerId);
@@ -94,6 +97,7 @@ export async function handler(context: PluginContext) {
       Date.now() + policy.maxSnapshotAgeSeconds * 1000,
     ).toISOString(),
   };
+  state.enqueueAttempted = true;
   const submitted = await relayer.sendTransaction(transactionRequest);
   if (
     (submitted as unknown as { fee_ceiling_wei?: string }).fee_ceiling_wei !==
@@ -110,4 +114,34 @@ export async function handler(context: PluginContext) {
     report,
     submissionSnapshot,
   };
+}
+
+/** A typed cap rejection is returned only before the enqueue call is reachable. */
+export async function handler(context: PluginContext) {
+  const state = { enqueueAttempted: false };
+  try {
+    return await execute(context, state);
+  } catch (error) {
+    if (
+      error instanceof ActionError &&
+      !state.enqueueAttempted &&
+      error.code === "GAS_LIMIT_CAP_EXCEEDED" &&
+      error.details
+    ) {
+      return {
+        mode: "rejected" as const,
+        schemaVersion: 1,
+        relayerId: error.details.relayerId,
+        stage: "validation",
+        enqueueAttempted: false,
+        requiresReconciliation: false,
+        error: {
+          code: error.code,
+          message: error.message,
+          details: error.details,
+        },
+      };
+    }
+    throw error;
+  }
 }

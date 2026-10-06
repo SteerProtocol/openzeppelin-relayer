@@ -50,6 +50,21 @@ pub fn map_provider_error(error: &ProviderError) -> (i32, &'static str) {
         ProviderError::RequestError { .. } => {
             (OpenZeppelinErrorCodes::REQUEST_ERROR, "Request error")
         }
+        // Preserve positively identified execution failures for guarded simulation.
+        // Keep provider URLs, revert bytes and arbitrary messages private.
+        ProviderError::RpcErrorCode { code, message }
+            if matches!(*code, 3 | -32000 | -32015)
+                && [
+                    "execution reverted",
+                    "out of gas",
+                    "intrinsic gas too low",
+                    "gas required exceeds allowance",
+                ]
+                .iter()
+                .any(|kind| message.to_lowercase().contains(kind)) =>
+        {
+            (*code as i32, "execution reverted")
+        }
         ProviderError::Other(_) => (RpcErrorCodes::INTERNAL_ERROR, "Internal error"),
         _ => (RpcErrorCodes::INTERNAL_ERROR, "Internal error"),
     }
@@ -99,6 +114,32 @@ pub fn sanitize_error_description(error: &ProviderError) -> String {
 mod tests {
     use super::*;
     use crate::services::provider::{rpc_selector::RpcSelectorError, SolanaProviderError};
+
+    #[test]
+    fn test_execution_failures_preserve_classification_without_provider_details() {
+        for code in [3, -32000, -32015] {
+            let error = ProviderError::RpcErrorCode {
+                code,
+                message: "execution reverted at https://private-provider.example/credential".into(),
+            };
+            assert_eq!(
+                map_provider_error(&error),
+                (code as i32, "execution reverted")
+            );
+            assert!(!sanitize_error_description(&error).contains("credential"));
+        }
+        for message in [
+            "insufficient funds",
+            "upstream unavailable",
+            "invalid params",
+        ] {
+            let error = ProviderError::RpcErrorCode {
+                code: -32000,
+                message: message.into(),
+            };
+            assert_eq!(map_provider_error(&error).0, RpcErrorCodes::INTERNAL_ERROR);
+        }
+    }
 
     #[test]
     fn test_map_provider_error_invalid_address() {
