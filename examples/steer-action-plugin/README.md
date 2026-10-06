@@ -197,3 +197,49 @@ never changes the accepted transaction's pricing silently or retries submission.
 `GAS_LIMIT_CAP_EXCEEDED` includes the guarded estimate, required limit with the
 configured plugin margin and enforced ceiling. Do not remove caps or margins just
 to turn validation green; evaluate the action and operator policy first.
+
+### Gas policy telemetry and cap rejections
+
+`maxGas` is the hard outer operator maximum, not the gas allocated to every action.
+The plugin still uses `ceil(completedEstimate * (10000 + marginBps) / 10000)` and
+never clamps a required limit down to the cap. Inner strategy/GasVault allowance
+is validated independently and is not copied to the outer limit.
+
+Completed estimates log a versioned JSON outcome with chain/keeper/strategy,
+action hash, snapshot, inner allowance, raw estimate, required limit, hard and
+block-bounded maxima, margin and cap utilization. The policy version is a hash
+of normalized operator settings. Event names are `steer_gas_estimated`,
+`steer_gas_near_cap` (at least 80%) and `steer_gas_cap_exceeded`. No provider URLs,
+keys or calldata are included. Estimate-only requests also produce these events;
+they measure policy pressure, not accepted or mined transactions.
+
+A cap rejection before enqueue returns successful transport data containing:
+
+```json
+{
+  "schemaVersion": 1,
+  "mode": "rejected",
+  "relayerId": "arbitrum-node-1",
+  "stage": "validation",
+  "enqueueAttempted": false,
+  "requiresReconciliation": false,
+  "error": {
+    "code": "GAS_LIMIT_CAP_EXCEEDED",
+    "message": "GAS_LIMIT_CAP_EXCEEDED: ...",
+    "details": {
+      "relayerId": "arbitrum-node-1",
+      "guardedEstimate": 1107592,
+      "requiredGasLimit": 1218352,
+      "effectiveMaxGas": 1200000
+    }
+  }
+}
+```
+
+Details also carry the telemetry fields above. A transport-success envelope is
+not submission success: callers must distinguish `mode: rejected` from `submit`.
+Only this validated response establishes non-enqueue. Generic HTTP failures,
+timeouts and errors after the single enqueue attempt remain ambiguous and must
+be reconciled. Deploy compatible processor handling before this plugin change.
+No automatic retry, signer fallback, unbounded cap increase or history store is
+introduced. Fresh strategy-ID or inner-allowance changes invalidate the report.

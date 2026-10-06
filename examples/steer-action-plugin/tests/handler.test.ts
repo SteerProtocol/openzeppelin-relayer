@@ -56,6 +56,7 @@ test("estimate mode never queues a transaction", async () => {
 test("submit queues original payload once with checked gas and initial fee", async () => {
   const { ctx, sent, calls } = context("submit");
   const result = await handler(ctx);
+  assert.ok("transactionId" in result);
   assert.equal(result.transactionId, "tx-123");
   assert.equal(result.relayerId, "keeper");
   const request = sent[0] as Record<string, unknown>;
@@ -222,4 +223,49 @@ test("a server that does not acknowledge the ceiling requires reconciliation wit
     /tx-123; reconcile accepted transaction/,
   );
   assert.equal(c.sent.length, 1);
+});
+
+test("gas-cap rejection is structured, observable and never enqueues", async () => {
+  const c = context("submit", (method, params) => {
+    if (
+      method === "eth_estimateGas" &&
+      (params[0] as any).gas &&
+      (params[2] as any)?.[policy.profile.deployments!.Orchestrator!]?.code !==
+        "0x60006000fd"
+    ) {
+      return "0xf4240"; // 1M estimate needs 1.1M with margin.
+    }
+  });
+  const logs: string[] = [];
+  const original = console.warn;
+  console.warn = (message: string) => logs.push(message);
+  try {
+    const result = await handler(c.ctx);
+    assert.ok(result.mode === "rejected");
+    assert.ok("error" in result);
+    assert.equal(result.enqueueAttempted, false);
+    assert.equal(result.requiresReconciliation, false);
+    assert.equal(result.error.code, "GAS_LIMIT_CAP_EXCEEDED");
+    assert.equal(result.error.details.requiredGasLimit, 1100000);
+    assert.equal(result.error.details.effectiveMaxGas, 1000000);
+    assert.equal(c.sent.length, 0);
+    const event = JSON.parse(logs[0]);
+    assert.equal(event.event, "steer_gas_cap_exceeded");
+    assert.equal(event.innerGasAllowance, "500000");
+    assert.equal(event.capUtilizationBps, 11000);
+    assert.ok(!logs[0].includes(data));
+  } finally {
+    console.warn = original;
+  }
+});
+
+test("even a typed error after enqueue remains ambiguous", async () => {
+  const c = context("submit");
+  const { ActionError } = await import("../errors");
+  c.relayer.sendTransaction = async () => {
+    throw new ActionError("GAS_LIMIT_CAP_EXCEEDED", "late failure", {
+      relayerId: "keeper",
+    });
+  };
+  await assert.rejects(handler(c.ctx), /late failure/);
 });
