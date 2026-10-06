@@ -301,3 +301,21 @@ test("funding fee ceiling uses inner allowance and submission preserves the lowe
     "25000000",
   );
 });
+
+test("fee-dependent metadata reads use bounded gas rather than the provider default", async () => {
+  const { rpc, calls } = mockRpc();
+  await estimateAction(rpc, policy, { data, mode: "estimate" }, from);
+  const selector = CORE_ABIS.GasVault.getFunction(
+    "gasAvailableForTransaction",
+  )!.selector;
+  const call = calls.find(
+    (c) =>
+      c.method === "eth_call" &&
+      (c.params[0] as { data?: string }).data?.startsWith(selector),
+  );
+  assert.ok(call);
+  assert.equal(
+    BigInt((call.params[0] as { gas: string }).gas),
+    BigInt(policy.maxGas),
+  );
+});
