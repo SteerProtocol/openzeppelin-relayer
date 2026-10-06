@@ -191,6 +191,7 @@ mod tests {
                         private_transactions: Some(false),
                         min_balance: Some(0),
                         gas_limit_estimation: None,
+                        gas_limit_buffer_percent: None,
                     }
                     .into(),
                 )),

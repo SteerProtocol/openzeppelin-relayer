@@ -32,6 +32,7 @@ pub struct ConfigFileRelayerEvmPolicy {
     pub private_transactions: Option<bool>,
     pub min_balance: Option<u128>,
     pub gas_limit_estimation: Option<bool>,
+    pub gas_limit_buffer_percent: Option<u16>,
     pub include_revert_data: Option<bool>,
 }
 
@@ -397,6 +398,7 @@ fn convert_config_policies_to_domain(
             Ok(RelayerNetworkPolicy::Evm(super::RelayerEvmPolicy {
                 min_balance: evm_policy.min_balance,
                 gas_limit_estimation: evm_policy.gas_limit_estimation,
+                gas_limit_buffer_percent: evm_policy.gas_limit_buffer_percent,
                 gas_price_cap: evm_policy.gas_price_cap,
                 whitelist_receivers: evm_policy.whitelist_receivers,
                 eip1559_pricing: evm_policy.eip1559_pricing,
@@ -908,6 +910,7 @@ mod tests {
             private_transactions: Some(false),
             min_balance: Some(2000000000000000000),
             gas_limit_estimation: Some(true),
+            gas_limit_buffer_percent: None,
         });
 
         let domain_policy = convert_config_policies_to_domain(config_policy).unwrap();
@@ -1038,6 +1041,7 @@ mod tests {
                     private_transactions: None,
                     min_balance: None,
                     gas_limit_estimation: None,
+                    gas_limit_buffer_percent: None,
                 },
             )),
             signer_id: "test-signer".to_string(),
@@ -1331,6 +1335,7 @@ mod tests {
             private_transactions: Some(true),
             min_balance: Some(500000000000000000),
             gas_limit_estimation: Some(true),
+            gas_limit_buffer_percent: None,
         };
 
         let serialized = serde_json::to_string(&evm_policy).unwrap();

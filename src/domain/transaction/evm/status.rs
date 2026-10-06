@@ -207,6 +207,15 @@ where
         let receipt_result = self.provider().get_transaction_receipt(tx_hash).await?;
 
         if let Some(receipt) = receipt_result {
+            let gas_used = receipt.inner.gas_used;
+            let gas_limit = evm_data.gas_limit;
+            let gas_utilization_percent = gas_limit
+                .filter(|limit| *limit > 0)
+                .map(|limit| gas_used as f64 * 100.0 / limit as f64);
+            info!(transaction_id = %tx.id, relayer_id = %tx.relayer_id,
+                transaction_hash = %tx_hash, receipt_status = receipt.inner.status(),
+                gas_used, gas_limit, gas_utilization_percent,
+                "on-chain transaction gas usage");
             if !receipt.inner.status() {
                 return Ok(TransactionStatus::Failed);
             }
