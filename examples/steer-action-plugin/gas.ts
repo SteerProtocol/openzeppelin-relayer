@@ -80,7 +80,21 @@ export async function readSnapshot(
     hash: hash(b.hash, "block hash"),
     gasLimit: toQuantity(quantity(b.gasLimit, "block gas limit")),
     timestamp: toQuantity(quantity(b.timestamp, "block timestamp")),
+    ...(b.baseFeePerGas === undefined
+      ? {}
+      : {
+          baseFeePerGas: toQuantity(
+            quantity(b.baseFeePerGas, "block base fee"),
+          ),
+        }),
   };
+}
+function requireBaseFee(gasPrice: bigint, snapshot: Snapshot): void {
+  if (gasPrice < BigInt(snapshot.baseFeePerGas ?? "0x0"))
+    throw new ActionError(
+      "FEE_BELOW_BASE_FEE",
+      "Selected gas price is below the simulation block base fee; re-estimate before submitting",
+    );
 }
 export function requireFresh(snapshot: Snapshot, policy: Policy): void {
   const age =
@@ -206,10 +220,20 @@ export async function estimateAction(
     ) !== 0n
   )
     throw new Error("Simulation code-copy address is occupied");
-  const gasPrice =
+  const quotedGasPrice =
     options.gasPrice === undefined
       ? quantity(await rpc("eth_gasPrice", []), "gas price")
       : BigInt(decimal(options.gasPrice, "gasPrice"));
+  if (quotedGasPrice <= 0n)
+    throw new Error("Gas price exceeds configured cap or is zero");
+  const baseFee = BigInt(snapshot.baseFeePerGas ?? "0x0");
+  // The oracle may quote a newer, cheaper block than the pinned snapshot.
+  // Use the snapshot's fee floor without changing gas limits or adding a buffer.
+  const gasPrice =
+    options.gasPrice === undefined && quotedGasPrice < baseFee
+      ? baseFee
+      : quotedGasPrice;
+  requireBaseFee(gasPrice, snapshot);
   if (gasPrice <= 0n || gasPrice > BigInt(policy.maxGasPrice))
     throw new Error("Gas price exceeds configured cap or is zero");
   const ceiling =
@@ -307,8 +331,9 @@ export async function estimateAction(
   async function finish(estimate: bigint): Promise<GasReport> {
     const gas = (estimate * BigInt(10000 + policy.marginBps) + 9999n) / 10000n;
     if (estimate < 21000n || gas > ceiling)
-      throw new Error(
-        "Guarded estimate plus margin exceeds configured/block gas cap",
+      throw new ActionError(
+        "GAS_LIMIT_CAP_EXCEEDED",
+        `Guarded estimate ${estimate} plus configured margin requires ${gas} gas, above gas cap ${ceiling}`,
       );
     requireCompleted(
       await rpc("eth_call", [
@@ -353,6 +378,7 @@ export async function verifyBeforeSubmission(
   const snapshot = await readSnapshot(rpc);
   requireFresh(snapshot, policy);
   await checkDeployment(rpc, policy, snapshot);
+  requireBaseFee(BigInt(report.gasPrice), snapshot);
   const metadata = await readActionMetadata(
     rpc,
     policy,

@@ -41,6 +41,7 @@ export interface Action {
   mode: "estimate" | "submit";
 }
 export interface Snapshot {
+  baseFeePerGas?: string;
   number: string;
   hash: string;
   gasLimit: string;

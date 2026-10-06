@@ -183,3 +183,17 @@ result; increasing gas does not repair an invalid swap. Archive availability is 
 `config.ts` resolves the trusted chain policy and approved keeper. `types.ts` holds shared execution types. `validation.ts` holds input validators. `index.ts` orchestrates one request; `metadata.ts` and `gas.ts` remain the single metadata and simulation implementations. No mutable simulation state is shared across invocations.
 
 A shared endpoint changes IAM route granularity: permission to call it reaches every configured keeper unless the authenticated gateway enforces a caller-to-relayer allowlist. The plugin context does not provide an authenticated IAM principal. The chain map is an operator allowlist, not caller authorization. Before rollout, either verify that callers are authorized for every configured keeper, or enforce the authenticated principal's permitted `params.relayerId` at the trusted proxy. Never derive that principal from request body fields. Route-level IAM alone cannot preserve previous per-keeper isolation on a shared route.
+
+### Simulation fee floor
+
+`eth_gasPrice` can quote a newer block whose fee is lower than the pinned simulation
+block's base fee. Default pricing uses the greater of the oracle quote and the
+snapshot base fee, still subject to operator, strategy, relayer and GasVault caps.
+This changes the price per gas, not the gas limit, and adds no gas buffer. A pinned
+explicit price below that floor is rejected. A base-fee increase between estimation
+and the fresh submission snapshot returns `FEE_BELOW_BASE_FEE` before enqueue; it
+never changes the accepted transaction's pricing silently or retries submission.
+
+`GAS_LIMIT_CAP_EXCEEDED` includes the guarded estimate, required limit with the
+configured plugin margin and enforced ceiling. Do not remove caps or margins just
+to turn validation green; evaluate the action and operator policy first.
