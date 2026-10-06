@@ -32,7 +32,7 @@ COPY --from=base --chown=nonroot:nonroot /usr/app/bin/openzeppelin-relayer /app/
 COPY --from=base /usr/lib/libssl.so.3 /usr/lib/libssl.so.3
 COPY --from=base /usr/lib/libcrypto.so.3 /usr/lib/libcrypto.so.3
 
-ARG NODE_VERSION=20.19
+ARG NODE_VERSION=22.22
 USER root
 RUN apk add --no-cache nodejs=~${NODE_VERSION} npm
 ENV PATH="/usr/local/bin:$PATH"
@@ -52,6 +52,14 @@ WORKDIR /app/plugins
 # postinstall after ts-node is already gone.
 RUN pnpm install --frozen-lockfile \
  && pnpm prune --prod --ignore-scripts
+
+# Install the action plugin beside the pooled runtime. Its sources and pinned
+# runtime dependencies must be available to the plugin compiler at startup.
+USER root
+COPY --chown=nonroot:nonroot ./examples/steer-action-plugin /app/plugins/steer-action-plugin
+WORKDIR /app/plugins/steer-action-plugin
+RUN npm ci --omit=dev --ignore-scripts && chown -R nonroot:nonroot /app/plugins/steer-action-plugin
+USER nonroot
 
 # Return to app root
 WORKDIR /app

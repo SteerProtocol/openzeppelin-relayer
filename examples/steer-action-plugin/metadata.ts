@@ -2,7 +2,7 @@ import {
   abis,
   getContractAddressByChainIdAndContractName,
 } from "@steerprotocol/sdk";
-import { Interface, getAddress, type InterfaceAbi } from "ethers";
+import { Interface, getAddress, type InterfaceAbi, toQuantity } from "ethers";
 import orchestratorAbi from "./orchestrator-abi.json";
 import { ActionError } from "./errors";
 import type {
@@ -61,7 +61,7 @@ export async function readCore(
   method: string,
   args: unknown[],
   snapshot: Snapshot,
-  context: Partial<Transaction> = {},
+  context: Partial<Transaction> & { gas?: string } = {},
 ) {
   const abi = CORE_ABIS[name];
   const result = await rpc("eth_call", [
@@ -169,7 +169,11 @@ export async function readActionMetadata(
       "gasAvailableForTransaction",
       [target],
       snapshot,
-      { from: transaction.from, gasPrice: transaction.gasPrice },
+      {
+        from: transaction.from,
+        gasPrice: transaction.gasPrice,
+        gas: toQuantity(policy.maxGas),
+      },
     )
   )[0] as bigint;
   if (allowance !== strategy.maxGasPerAction)

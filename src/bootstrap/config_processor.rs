@@ -118,6 +118,23 @@ where
     }
 }
 
+/// Startup configuration is authoritative for explicitly registered plugins.
+async fn reconcile_configured_plugins<PR: PluginRepositoryTrait>(
+    config: &Config,
+    repository: &PR,
+) -> Result<()> {
+    for configured in config.plugins.iter().flatten() {
+        let model = PluginModel::try_from(configured.clone())?;
+        if repository.get_by_id(&model.id).await?.is_some() {
+            repository.update(model.clone()).await?;
+            repository.invalidate_compiled_code(&model.id).await?;
+        } else {
+            repository.add(model).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Process a signer configuration from the config file and convert it into a `SignerRepoModel`.
 async fn process_signer(signer: &SignerFileConfig) -> Result<SignerRepoModel> {
     // Convert config to domain model (this validates and applies business logic)
@@ -416,6 +433,15 @@ where
     PR: PluginRepositoryTrait + Send + Sync + 'static,
     AKR: ApiKeyRepositoryTrait + Send + Sync + 'static,
 {
+    // A single-worker deployment may add an opt-in plugin to populated Redis.
+    // Reconcile only configured plugins; never reset signer/transaction/nonce state.
+    if server_config.repository_storage_type == RepositoryStorageType::Redis
+        && !server_config.reset_storage_on_start
+        && !ServerConfig::get_distributed_mode()
+        && app_state.relayer_repository.has_entries().await?
+    {
+        reconcile_configured_plugins(&config_file, app_state.plugin_repository.as_ref()).await?;
+    }
     match server_config.repository_storage_type {
         RepositoryStorageType::InMemory => {
             // In-memory mode: no locking needed, process directly
@@ -836,6 +862,40 @@ mod tests {
     use mockito;
     use serde_json::json;
     use std::{sync::Arc, time::Duration};
+
+    #[tokio::test]
+    async fn test_reconcile_configured_plugins_adds_and_updates_without_reset() -> Result<()> {
+        use crate::repositories::InMemoryPluginRepository;
+        let repository = InMemoryPluginRepository::new();
+        let plugin = serde_json::from_value(serde_json::json!({
+            "id": "steer-action", "path": "steer-action-plugin/index.ts",
+            "timeout": 120, "config": {"chains": {}}
+        }))?;
+        let mut config = Config {
+            relayers: vec![],
+            signers: vec![],
+            notifications: vec![],
+            networks: NetworksFileConfig::new(vec![])?,
+            plugins: Some(vec![plugin]),
+        };
+        reconcile_configured_plugins(&config, &repository).await?;
+        assert_eq!(repository.count().await?, 1);
+        config.plugins.as_mut().unwrap()[0].timeout = Some(90);
+        reconcile_configured_plugins(&config, &repository).await?;
+        assert_eq!(
+            repository
+                .get_by_id("steer-action")
+                .await?
+                .unwrap()
+                .timeout
+                .as_secs(),
+            90
+        );
+        config.plugins = None;
+        reconcile_configured_plugins(&config, &repository).await?;
+        assert_eq!(repository.count().await?, 1);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_gas_limit_buffer_reconciliation_preserves_state() -> Result<()> {
