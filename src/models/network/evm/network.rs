@@ -1,7 +1,7 @@
 use crate::config::GasPriceCacheConfig;
 use crate::constants::{
-    ARBITRUM_BASED_TAG, LACKS_MEMPOOL_TAGS, OPTIMISM_BASED_TAG, OPTIMISM_TAG, POLYGON_ZKEVM_TAG,
-    ROLLUP_TAG,
+    ARBITRUM_BASED_TAG, KNOWN_ARBITRUM_CHAIN_IDS, LACKS_MEMPOOL_TAGS, OPTIMISM_BASED_TAG,
+    OPTIMISM_TAG, POLYGON_ZKEVM_TAG, ROLLUP_TAG,
 };
 use crate::models::{NetworkConfigData, NetworkRepoModel, RepositoryError, RpcConfig};
 use std::time::Duration;
@@ -144,7 +144,8 @@ impl EvmNetwork {
     }
 
     pub fn is_arbitrum(&self) -> bool {
-        self.tags.iter().any(|t| t == ARBITRUM_BASED_TAG)
+        KNOWN_ARBITRUM_CHAIN_IDS.contains(&self.chain_id)
+            || self.tags.iter().any(|t| t == ARBITRUM_BASED_TAG)
     }
 
     pub fn is_polygon_zkevm(&self) -> bool {
@@ -304,6 +305,17 @@ mod tests {
         assert!(network.is_arbitrum());
         assert!(network.lacks_mempool());
         assert!(!network.is_optimism());
+    }
+
+    #[test]
+    fn test_arbitrum_chain_ids_work_without_optional_tags() {
+        for chain_id in [42161, 42170, 421614] {
+            let mut network = create_test_evm_network_with_tags(vec![]);
+            network.chain_id = chain_id;
+            assert!(network.is_arbitrum());
+        }
+        let network = create_test_evm_network_with_tags(vec![]);
+        assert!(!network.is_arbitrum());
     }
 
     #[test]

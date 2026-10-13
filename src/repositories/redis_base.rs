@@ -127,9 +127,12 @@ pub trait RedisRepository {
         pool: &Arc<Pool>,
         context: &str,
     ) -> Result<Connection, RepositoryError> {
-        pool.get()
-            .await
-            .map_err(|e| self.map_pool_error(e, context))
+        let started = std::time::Instant::now();
+        let result = pool.get().await;
+        crate::metrics::REDIS_POOL_ACQUIRE
+            .with_label_values(&[context, if result.is_ok() { "ok" } else { "error" }])
+            .observe(started.elapsed().as_secs_f64());
+        result.map_err(|e| self.map_pool_error(e, context))
     }
 }
 

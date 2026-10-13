@@ -126,6 +126,27 @@ pub struct TransactionSend {
 }
 
 impl TransactionSend {
+    /// Explicit API cancellation still uses the repricing/signing Resubmit
+    /// path, but must not be swallowed by automatic-recovery suppression.
+    pub(crate) fn cancellation_resubmit(
+        transaction_id: impl Into<String>,
+        relayer_id: impl Into<String>,
+    ) -> Self {
+        let mut job = Self::resubmit(transaction_id, relayer_id);
+        job.metadata = Some(HashMap::from([(
+            "explicit_cancellation".to_string(),
+            "true".to_string(),
+        )]));
+        job
+    }
+
+    pub(crate) fn is_explicit_cancellation(&self) -> bool {
+        matches!(self.command, TransactionCommand::Cancel { .. })
+            || self.metadata.as_ref().is_some_and(|metadata| {
+                metadata.get("explicit_cancellation").map(String::as_str) == Some("true")
+            })
+    }
+
     // Submit a transaction to the relayer
     pub fn submit(transaction_id: impl Into<String>, relayer_id: impl Into<String>) -> Self {
         Self {

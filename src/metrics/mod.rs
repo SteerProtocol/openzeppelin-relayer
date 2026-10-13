@@ -56,6 +56,23 @@ lazy_static! {
     // Global Prometheus registry.
     pub static ref REGISTRY: Registry = Registry::new();
 
+    /// Pool checkout time, including deadpool connection recycling.
+    pub static ref REDIS_POOL_ACQUIRE: HistogramVec = {
+        let opts = HistogramOpts::new("redis_pool_acquire_seconds", "Redis repository pool checkout time")
+            .buckets(vec![0.001, 0.01, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 120.0]);
+        let metric = HistogramVec::new(opts, &["operation", "outcome"]).unwrap();
+        REGISTRY.register(Box::new(metric.clone())).unwrap();
+        metric
+    };
+
+    /// Enqueue decisions made by the automatic EVM submission guard.
+    pub static ref SUBMISSION_CONTROL_DECISIONS: CounterVec = {
+        let opts = Opts::new("submission_control_decisions_total", "Automatic submission enqueue decisions");
+        let metric = CounterVec::new(opts, &["relayer_id", "decision", "reason"]).unwrap();
+        REGISTRY.register(Box::new(metric.clone())).unwrap();
+        metric
+    };
+
     // Counter: Total HTTP requests.
     pub static ref REQUEST_COUNTER: CounterVec = {
         let opts = Opts::new("requests_total", "Total number of HTTP requests");

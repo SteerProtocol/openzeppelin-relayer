@@ -14,7 +14,7 @@ use crate::{
     constants::{
         matches_known_transaction, ALREADY_SUBMITTED_PATTERNS, DEFAULT_EVM_GAS_LIMIT_ESTIMATION,
         DEFAULT_EVM_STATUS_CHECK_RETRY_DELAY_SECONDS, GAS_LIMIT_BUFFER_MULTIPLIER,
-        MAX_NONCE_TOO_HIGH_RETRIES, NONCE_TOO_HIGH_PATTERNS,
+        KNOWN_ARBITRUM_CHAIN_IDS, MAX_NONCE_TOO_HIGH_RETRIES, NONCE_TOO_HIGH_PATTERNS,
     },
     domain::{
         evm::is_noop,
@@ -392,7 +392,8 @@ where
             relayer_id = %tx.relayer_id,
             "enqueueing submit transaction job"
         );
-        let job = TransactionSend::submit(tx.id.clone(), tx.relayer_id.clone());
+        let job = TransactionSend::submit(tx.id.clone(), tx.relayer_id.clone())
+            .with_network_type(NetworkType::Evm);
 
         self.job_producer()
             .produce_submit_transaction_job(job, None)
@@ -412,7 +413,8 @@ where
             relayer_id = %tx.relayer_id,
             "enqueueing resubmit transaction job"
         );
-        let job = TransactionSend::resubmit(tx.id.clone(), tx.relayer_id.clone());
+        let job = TransactionSend::resubmit(tx.id.clone(), tx.relayer_id.clone())
+            .with_network_type(NetworkType::Evm);
 
         self.job_producer()
             .produce_submit_transaction_job(job, None)
@@ -432,7 +434,8 @@ where
             relayer_id = %tx.relayer_id,
             "enqueueing resend transaction job"
         );
-        let job = TransactionSend::resend(tx.id.clone(), tx.relayer_id.clone());
+        let job = TransactionSend::resend(tx.id.clone(), tx.relayer_id.clone())
+            .with_network_type(NetworkType::Evm);
 
         self.job_producer()
             .produce_submit_transaction_job(job, None)
@@ -868,7 +871,8 @@ where
         // after preparing the transaction, we need to submit it to the job queue
         self.job_producer
             .produce_submit_transaction_job(
-                TransactionSend::submit(updated_tx.id.clone(), updated_tx.relayer_id.clone()),
+                TransactionSend::submit(updated_tx.id.clone(), updated_tx.relayer_id.clone())
+                    .with_network_type(NetworkType::Evm),
                 None,
             )
             .await?;
@@ -1110,7 +1114,10 @@ where
             return Ok(tx);
         }
 
-        let evm_data = tx.network_data.get_evm_transaction_data()?;
+        let mut evm_data = tx.network_data.get_evm_transaction_data()?;
+        if is_noop(&evm_data) && KNOWN_ARBITRUM_CHAIN_IDS.contains(&evm_data.chain_id) {
+            super::utils::refresh_arbitrum_noop_gas(&mut evm_data, &self.provider).await?;
+        }
 
         // Calculate bumped gas price
         // For noop transactions, force_bump=true to skip gas price cap and ensure bump succeeds
@@ -1318,8 +1325,18 @@ where
             .partial_update(tx.id.clone(), update)
             .await?;
 
-        // Submit the updated transaction to the network using the resubmit job
-        self.send_transaction_resubmit_job(&updated_tx).await?;
+        // Explicit cancellation needs the resubmit path to sign the new NOOP,
+        // but must bypass the automatic retry budget/cooldown for the old action.
+        self.job_producer()
+            .produce_submit_transaction_job(
+                TransactionSend::cancellation_resubmit(
+                    updated_tx.id.clone(),
+                    updated_tx.relayer_id.clone(),
+                )
+                .with_network_type(NetworkType::Evm),
+                None,
+            )
+            .await?;
 
         // Send notification for the updated transaction
         if let Err(e) = self.send_transaction_update_notification(&updated_tx).await {

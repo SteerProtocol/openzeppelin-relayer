@@ -8,7 +8,7 @@
 use actix_web::web::ThinData;
 use chrono::Utc;
 use eyre::Result;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::{
     constants::{
@@ -16,11 +16,11 @@ use crate::{
         WORKER_TRANSACTION_RESUBMIT_RETRIES, WORKER_TRANSACTION_SUBMIT_RETRIES,
     },
     domain::{get_relayer_transaction, get_transaction_by_id, Transaction},
-    jobs::{handle_result, Job, TransactionCommand, TransactionSend},
+    jobs::{handle_result, Job, JobProducerTrait, TransactionCommand, TransactionSend},
     metrics::{observe_processing_time, STAGE_SUBMISSION_QUEUE_DWELL, STAGE_SUBMIT_DURATION},
-    models::DefaultAppState,
+    models::{DefaultAppState, TransactionRepoModel, TransactionStatus},
     observability::request_id::set_request_id,
-    queues::{HandlerError, WorkerContext},
+    queues::{redis::submission_control, HandlerError, WorkerContext},
 };
 
 #[instrument(
@@ -54,15 +54,81 @@ pub async fn transaction_submission_handler(
 
     let command = job.data.command.clone();
     let job_timestamp = job.timestamp.clone();
-    let result = handle_request(job.data, &state, &job_timestamp).await;
+    let submission = job.data.clone();
+    info!(
+        tx_id = %submission.transaction_id,
+        relayer_id = %submission.relayer_id,
+        task_id = %ctx.task_id,
+        "submission job picked up"
+    );
+    let mut result = handle_request(job.data, &state, &job_timestamp).await;
+
+    // Only guarded messages carry the owning Apalis task ID. Legacy messages
+    // cannot release a newer reservation, and non-Redis backends are untouched.
+    if submission
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get(submission_control::OWNER_METADATA))
+        == Some(&ctx.task_id)
+    {
+        if let Some(queue) = state
+            .job_producer
+            .get_queue_backend()
+            .and_then(|b| b.queue().cloned())
+        {
+            let progress = matches!(&result, Ok(true));
+            let permanent = result.as_ref().err().is_some_and(|e| {
+                e.to_string()
+                    .to_lowercase()
+                    .contains("intrinsic gas too low")
+            });
+            match submission_control::finish(
+                &queue.transaction_submission_queue,
+                &submission,
+                &ctx.task_id,
+                progress,
+                permanent,
+            )
+            .await
+            {
+                Ok(true) => {
+                    let reason = result
+                        .as_ref()
+                        .err()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| {
+                            "retry budget exhausted without submission progress".to_string()
+                        });
+                    return Err(HandlerError::Abort(format!(
+                        "Automatic submission failed: {reason}; nonce requires reconciliation"
+                    )));
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    // Enqueue recovers this reservation from the durable ACK.
+                    warn!(tx_id = %submission.transaction_id, %error, "submission completion control update failed");
+                }
+            }
+        }
+        result = require_submission_progress(result);
+    }
 
     // Handle result with command-specific retry logic
     handle_result(
-        result,
+        result.map(|_| ()),
         &ctx,
         "Transaction Submission",
         get_max_retries(&command),
     )
+}
+
+fn require_submission_progress(result: Result<bool>) -> Result<bool> {
+    match result {
+        Ok(false) => Err(eyre::eyre!(
+            "Submission failed: no broadcast or transaction progress"
+        )),
+        outcome => outcome,
+    }
 }
 
 /// Get max retry count based on command type
@@ -79,7 +145,7 @@ async fn handle_request(
     status_request: TransactionSend,
     state: &ThinData<DefaultAppState>,
     job_timestamp: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let relayer_transaction =
         get_relayer_transaction(status_request.relayer_id.clone(), state).await?;
 
@@ -114,11 +180,10 @@ async fn handle_request(
     );
 
     let submit_start = std::time::Instant::now();
+    let previous = transaction.clone();
 
-    match status_request.command {
-        TransactionCommand::Submit => {
-            relayer_transaction.submit_transaction(transaction).await?;
-        }
+    let updated = match status_request.command {
+        TransactionCommand::Submit => relayer_transaction.submit_transaction(transaction).await?,
         TransactionCommand::Cancel { reason } => {
             info!(
                 tx_id = %tx_id,
@@ -126,7 +191,7 @@ async fn handle_request(
                 status_reason = %reason,
                 "cancelling transaction"
             );
-            relayer_transaction.submit_transaction(transaction).await?;
+            relayer_transaction.submit_transaction(transaction).await?
         }
         TransactionCommand::Resubmit => {
             debug!(
@@ -136,7 +201,7 @@ async fn handle_request(
             );
             relayer_transaction
                 .resubmit_transaction(transaction)
-                .await?;
+                .await?
         }
         TransactionCommand::Resend => {
             debug!(
@@ -144,7 +209,7 @@ async fn handle_request(
                 relayer_id = %relayer_id,
                 "resending transaction"
             );
-            relayer_transaction.submit_transaction(transaction).await?;
+            relayer_transaction.submit_transaction(transaction).await?
         }
     };
 
@@ -164,13 +229,78 @@ async fn handle_request(
         "transaction submission completed"
     );
 
-    Ok(())
+    Ok(made_submission_progress(&previous, &updated))
+}
+
+fn made_submission_progress(before: &TransactionRepoModel, after: &TransactionRepoModel) -> bool {
+    // Nonce-too-high can return Ok without changing a Sent OR Submitted record.
+    // Neither is progress; otherwise already-Submitted records bypass the budget.
+    if matches!(
+        after.status,
+        TransactionStatus::Pending | TransactionStatus::Sent
+    ) {
+        return false;
+    }
+    after.status != before.status
+        || after.hashes != before.hashes
+        || after.sent_at != before.sent_at
+        || !matches!(after.status, TransactionStatus::Submitted)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn unsuccessful_submission_is_not_acknowledged_as_success() {
+        let outcome = require_submission_progress(Ok(false));
+        assert!(outcome
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("no broadcast"));
+        let handled = handle_result(
+            outcome.map(|_| ()),
+            &WorkerContext::new(0, "task".into()),
+            "Transaction Submission",
+            0,
+        );
+        assert!(matches!(handled, Err(HandlerError::Abort(_))));
+        assert!(require_submission_progress(Ok(true)).is_ok());
+        assert!(
+            require_submission_progress(Err(eyre::eyre!("intrinsic gas too low")))
+                .unwrap_err()
+                .to_string()
+                .contains("intrinsic gas too low")
+        );
+    }
+
+    #[test]
+    fn unchanged_submitted_or_sent_transactions_consume_recovery_budget() {
+        use crate::domain::transaction::evm::test_helpers::test_utils::make_test_transaction;
+        for status in [TransactionStatus::Sent, TransactionStatus::Submitted] {
+            let before = make_test_transaction(status);
+            let mut after = before.clone();
+            after.status_reason = Some("Nonce too high (attempt 600)".to_string());
+            assert!(!made_submission_progress(&before, &after));
+        }
+    }
+
+    #[test]
+    fn broadcast_or_confirmation_resets_recovery_budget() {
+        use crate::domain::transaction::evm::test_helpers::test_utils::make_test_transaction;
+        let before = make_test_transaction(TransactionStatus::Submitted);
+        let mut after = before.clone();
+        after.hashes.push("replacement-hash".to_string());
+        assert!(made_submission_progress(&before, &after));
+        after = before.clone();
+        after.sent_at = Some("2026-10-13T14:00:00Z".to_string());
+        assert!(made_submission_progress(&before, &after));
+        after = before.clone();
+        after.status = TransactionStatus::Confirmed;
+        assert!(made_submission_progress(&before, &after));
+    }
 
     #[tokio::test]
     async fn test_submission_handler_job_validation() {

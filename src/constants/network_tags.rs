@@ -1,6 +1,9 @@
 /// Network tag constants for EVM networks
 pub const NO_MEMPOOL_TAG: &str = "no-mempool";
 pub const ARBITRUM_BASED_TAG: &str = "arbitrum-based";
+/// Canonical networks in config/networks/arbitrum.json. SDK-derived records may
+/// omit optional tags; their chain IDs still determine Arbitrum behavior.
+pub const KNOWN_ARBITRUM_CHAIN_IDS: [u64; 3] = [42161, 42170, 421614];
 pub const OPTIMISM_BASED_TAG: &str = "optimism-based";
 pub const POLYGON_ZKEVM_TAG: &str = "polygon-zkevm-based";
 /// @deprecated Use OPTIMISM_BASED_TAG instead. Will be removed in a future version.

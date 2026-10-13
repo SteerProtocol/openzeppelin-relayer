@@ -31,7 +31,10 @@ pub async fn make_noop<P: EvmProviderTrait>(
     if network.is_arbitrum() {
         // For Arbitrum networks, try to estimate gas to account for L1 + L2 costs
         if let Some(provider) = provider {
-            match provider.estimate_gas(evm_data).await {
+            // Use an unconstrained simulation request when estimating the
+            // replacement NOOP, independently of its persisted parameters.
+            let estimate = noop_estimation_request(evm_data);
+            match provider.estimate_gas(&estimate).await {
                 Ok(estimated_gas) => {
                     // Use the estimated gas, but ensure it's at least the default minimum
                     evm_data.gas_limit = Some(estimated_gas.max(DEFAULT_GAS_LIMIT));
@@ -55,6 +58,38 @@ pub async fn make_noop<P: EvmProviderTrait>(
     }
 
     Ok(())
+}
+
+/// Refresh a persisted NOOP before repricing/signing. Old Arbitrum records can
+/// retain 21000 gas from missing tags, and L1 posting gas can change over time.
+pub(super) async fn refresh_arbitrum_noop_gas<P: EvmProviderTrait>(
+    evm_data: &mut EvmTransactionData,
+    provider: &P,
+) -> Result<(), TransactionError> {
+    let estimate = noop_estimation_request(evm_data);
+    let required = provider.estimate_gas(&estimate).await?;
+    let buffered = required
+        .max(DEFAULT_GAS_LIMIT)
+        .checked_mul(crate::constants::GAS_LIMIT_BUFFER_MULTIPLIER)
+        .ok_or_else(|| {
+            TransactionError::ValidationError("NOOP gas estimate overflow".to_string())
+        })?
+        / 100;
+    evm_data.gas_limit = Some(buffered);
+    Ok(())
+}
+
+fn noop_estimation_request(evm_data: &EvmTransactionData) -> EvmTransactionData {
+    let mut estimate = evm_data.clone();
+    estimate.gas_limit = None;
+    // These are simulation-only omissions. A self-transfer does not depend on
+    // its nonce; stale fees or a future allocated nonce must not prevent its
+    // gas estimate. The transaction being signed retains all original fields.
+    estimate.nonce = None;
+    estimate.gas_price = None;
+    estimate.max_fee_per_gas = None;
+    estimate.max_priority_fee_per_gas = None;
+    estimate
 }
 
 /// Checks if a transaction is already a NOOP transaction
@@ -391,6 +426,7 @@ mod tests {
         mock_provider
             .expect_estimate_gas()
             .times(1)
+            .withf(|tx| tx.gas_limit.is_none())
             .returning(|_| Box::pin(async move { Ok(35_000) }));
 
         let mut evm_data = EvmTransactionData {
@@ -422,6 +458,51 @@ mod tests {
         assert_eq!(evm_data.data.unwrap(), "0x"); // Empty data
         assert_eq!(evm_data.nonce, Some(42)); // Original nonce preserved
         assert_eq!(evm_data.chain_id, 42161); // Chain ID preserved
+    }
+
+    #[tokio::test]
+    async fn test_arbitrum_persisted_noop_gets_fresh_unconstrained_gas() {
+        use crate::domain::transaction::evm::test_helpers::test_utils::make_test_transaction;
+        let tx = make_test_transaction(TransactionStatus::Sent);
+        let mut data = tx.network_data.get_evm_transaction_data().unwrap();
+        data.chain_id = 42161;
+        data.nonce = Some(117292);
+        data.to = Some(data.from.clone());
+        data.value = U256::ZERO;
+        data.data = Some("0x".to_string());
+        data.gas_limit = Some(21000);
+        let mut provider = MockEvmProviderTrait::new();
+        provider
+            .expect_estimate_gas()
+            .times(1)
+            .withf(|tx| tx.gas_limit.is_none() && tx.nonce.is_none() && tx.gas_price.is_none())
+            .returning(|_| Box::pin(async { Ok(22886) }));
+        refresh_arbitrum_noop_gas(&mut data, &provider)
+            .await
+            .unwrap();
+        assert!(data.gas_limit.unwrap() > 22886);
+        assert_eq!(data.nonce, Some(117292));
+        assert_eq!(data.to.as_ref(), Some(&data.from));
+        assert_eq!(data.value, U256::ZERO);
+        assert_eq!(data.data.as_deref(), Some("0x"));
+    }
+
+    #[tokio::test]
+    async fn test_arbitrum_noop_estimation_failure_preserves_original_transaction() {
+        use crate::domain::transaction::evm::test_helpers::test_utils::make_test_transaction;
+        let tx = make_test_transaction(TransactionStatus::Sent);
+        let mut data = tx.network_data.get_evm_transaction_data().unwrap();
+        data.gas_limit = Some(21000);
+        data.nonce = Some(117292);
+        let mut provider = MockEvmProviderTrait::new();
+        provider.expect_estimate_gas().times(1).returning(|_| {
+            Box::pin(async { Err(ProviderError::Other("RPC unavailable".to_string())) })
+        });
+        assert!(refresh_arbitrum_noop_gas(&mut data, &provider)
+            .await
+            .is_err());
+        assert_eq!(data.gas_limit, Some(21000));
+        assert_eq!(data.nonce, Some(117292));
     }
 
     #[tokio::test]
