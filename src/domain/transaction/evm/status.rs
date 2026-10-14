@@ -661,45 +661,40 @@ where
 
         // Check if transaction gas limit exceeds block gas limit before resubmitting
         let (should_noop, reason) = self.should_noop(&tx).await?;
-        let tx_to_process = if should_noop {
-            self.process_noop_transaction(&tx, reason).await?
-        } else {
-            tx
-        };
+        if should_noop && !is_noop(&tx.network_data.get_evm_transaction_data()?) {
+            return self
+                .fail_automatic_recovery(
+                    tx,
+                    reason
+                        .as_deref()
+                        .unwrap_or("automatic recovery is no longer valid"),
+                )
+                .await;
+        }
+        let tx_to_process = tx;
 
         self.send_transaction_resubmit_job(&tx_to_process).await?;
         Ok(tx_to_process)
     }
 
-    /// Handles NOOP transaction processing before resubmission
-    async fn process_noop_transaction(
+    /// Terminal automation failures preserve intent. Cancellation/replacement
+    /// requires an explicit operator decision after chain reconciliation.
+    async fn fail_automatic_recovery(
         &self,
-        tx: &TransactionRepoModel,
-        reason: Option<String>,
+        tx: TransactionRepoModel,
+        reason: &str,
     ) -> Result<TransactionRepoModel, TransactionError> {
-        debug!(
-            tx_id = %tx.id,
-            relayer_id = %tx.relayer_id,
-            status = ?tx.status,
-            "preparing transaction NOOP before resubmission"
-        );
-        let update = self.prepare_noop_update_request(tx, false, reason).await?;
-        let updated_tx = self
+        let updated = self
             .transaction_repository()
-            .partial_update(tx.id.clone(), update)
+            .partial_update(
+                tx.id.clone(),
+                TransactionRepoModel::automatic_submission_failure(reason),
+            )
             .await?;
-
-        let res = self.send_transaction_update_notification(&updated_tx).await;
-        if let Err(e) = res {
-            error!(
-                tx_id = %updated_tx.id,
-                relayer_id = %updated_tx.relayer_id,
-                status = ?updated_tx.status,
-                error = %e,
-                "sending transaction update notification failed for NOOP transaction"
-            );
+        if let Err(error) = self.send_transaction_update_notification(&updated).await {
+            warn!(tx_id = %updated.id, %error, "terminal failure notification failed");
         }
-        Ok(updated_tx)
+        Ok(updated)
     }
 
     /// Handles transactions in the Pending state.
@@ -775,43 +770,6 @@ where
     ) -> Result<TransactionRepoModel, TransactionError> {
         self.update_transaction_status_if_needed(tx, status, status_reason)
             .await
-    }
-
-    /// Marks a transaction as Failed with a given reason.
-    async fn mark_as_failed(
-        &self,
-        tx: TransactionRepoModel,
-        reason: String,
-    ) -> Result<TransactionRepoModel, TransactionError> {
-        warn!(
-            tx_id = %tx.id,
-            relayer_id = %tx.relayer_id,
-            reason = %reason,
-            "force-failing transaction due to circuit breaker"
-        );
-
-        let update = TransactionUpdateRequest {
-            status: Some(TransactionStatus::Failed),
-            status_reason: Some(reason),
-            ..Default::default()
-        };
-
-        let updated_tx = self
-            .transaction_repository()
-            .partial_update(tx.id.clone(), update)
-            .await?;
-
-        // Send notification (best effort)
-        if let Err(e) = self.send_transaction_update_notification(&updated_tx).await {
-            error!(
-                tx_id = %updated_tx.id,
-                relayer_id = %updated_tx.relayer_id,
-                error = %e,
-                "failed to send notification for force-failed transaction"
-            );
-        }
-
-        Ok(updated_tx)
     }
 
     /// Reconciles a single transaction's nonce state against on-chain reality.
@@ -957,102 +915,24 @@ where
         Ok(None)
     }
 
-    /// Handles circuit breaker safely based on transaction status.
-    ///
-    /// This method implements the safe circuit breaker logic:
-    /// - **Pending/Sent**: Safe to mark as Failed (never broadcast to network)
-    /// - **Submitted**: Must trigger NOOP to clear nonce slot (regardless of expiry)
-    ///
-    /// For Submitted transactions, we always issue a NOOP because the nonce slot is
-    /// occupied and the original transaction could still execute. Simply marking as
-    /// Failed/Expired would leave the nonce blocked and risk the relayer stopping.
-    ///
-    /// Note: NOOP transactions are filtered out before entering this function.
+    /// Stop failed automatic recovery without rewriting the signed intent as a
+    /// cancellation. A reserved nonce remains occupied until reconciliation.
     async fn handle_circuit_breaker_safely(
         &self,
         tx: TransactionRepoModel,
         ctx: &StatusCheckContext,
     ) -> Result<TransactionRepoModel, TransactionError> {
+        if !matches!(
+            tx.status,
+            TransactionStatus::Pending | TransactionStatus::Sent | TransactionStatus::Submitted
+        ) {
+            return Ok(tx);
+        }
         let reason = format!(
-            "Transaction status monitoring failed after {} consecutive errors (total: {}). \
-             Last status: {:?}.",
+            "status monitoring exhausted after {} consecutive errors (total: {}), last status {:?}",
             ctx.consecutive_failures, ctx.total_failures, tx.status
         );
-
-        match tx.status {
-            TransactionStatus::Pending => {
-                // Pending: no nonce assigned yet - safe to mark as Failed
-                debug!(
-                    tx_id = %tx.id,
-                    relayer_id = %tx.relayer_id,
-                    "circuit breaker: Pending transaction (no nonce) - safe to mark as Failed"
-                );
-                self.mark_as_failed(tx, reason).await
-            }
-            TransactionStatus::Sent => {
-                // Sent: nonce assigned but never broadcast to network.
-                // If a nonce is assigned, we must issue a NOOP to clear the nonce slot
-                // rather than just marking as Failed (which would leak the nonce).
-                let has_nonce = tx
-                    .network_data
-                    .get_evm_transaction_data()
-                    .map(|d| d.nonce.is_some())
-                    .unwrap_or(false);
-
-                if has_nonce {
-                    warn!(
-                        tx_id = %tx.id,
-                        relayer_id = %tx.relayer_id,
-                        "circuit breaker: Sent transaction with nonce assigned - triggering NOOP to clear nonce slot"
-                    );
-                    let noop_reason = Some(format!(
-                        "{reason}. Replacing with NOOP to clear nonce slot (Sent state with assigned nonce)."
-                    ));
-                    let updated_tx = self.process_noop_transaction(&tx, noop_reason).await?;
-                    // Must use resubmit (not submit) — resubmit re-signs with new gas pricing,
-                    // producing fresh `raw` bytes for the NOOP. submit_transaction would
-                    // broadcast the stale `raw` bytes which still contain the original tx.
-                    self.send_transaction_resubmit_job(&updated_tx).await?;
-                    Ok(updated_tx)
-                } else {
-                    // Defensive: Sent without nonce shouldn't normally happen
-                    debug!(
-                        tx_id = %tx.id,
-                        relayer_id = %tx.relayer_id,
-                        "circuit breaker: Sent transaction without nonce - safe to mark as Failed"
-                    );
-                    self.mark_as_failed(tx, reason).await
-                }
-            }
-            TransactionStatus::Submitted => {
-                // Submitted transactions occupy a nonce slot and could still execute.
-                // Regardless of expiry status, we MUST issue a NOOP to:
-                // 1. Clear the nonce slot so subsequent transactions can proceed
-                // 2. Prevent the original transaction from executing later
-                // Note: NOOP transactions are filtered out before entering this function.
-                warn!(
-                    tx_id = %tx.id,
-                    relayer_id = %tx.relayer_id,
-                    "circuit breaker: Submitted transaction - triggering NOOP to safely clear nonce"
-                );
-                let noop_reason = Some(format!(
-                    "{reason}. Replacing with NOOP to clear nonce slot."
-                ));
-                let updated_tx = self.process_noop_transaction(&tx, noop_reason).await?;
-                self.send_transaction_resubmit_job(&updated_tx).await?;
-                Ok(updated_tx)
-            }
-            _ => {
-                // Final states shouldn't reach here, but handle gracefully
-                debug!(
-                    tx_id = %tx.id,
-                    relayer_id = %tx.relayer_id,
-                    status = ?tx.status,
-                    "circuit breaker: unexpected status, returning transaction unchanged"
-                );
-                Ok(tx)
-            }
-        }
+        self.fail_automatic_recovery(tx, &reason).await
     }
 
     /// Inherent status-handling method.
@@ -1368,30 +1248,15 @@ where
 
         // Check if transaction should be replaced with NOOP (expired, too many attempts on rollup, etc.)
         let (should_noop, reason) = self.should_noop(&tx).await?;
-        if should_noop {
-            debug!(
-                tx_id = %tx.id,
-                relayer_id = %tx.relayer_id,
-                "preparing NOOP for sent transaction"
-            );
-            let update = self.prepare_noop_update_request(&tx, false, reason).await?;
-            let updated_tx = self
-                .transaction_repository()
-                .partial_update(tx.id.clone(), update)
-                .await?;
-
-            self.send_transaction_submit_job(&updated_tx).await?;
-            let res = self.send_transaction_update_notification(&updated_tx).await;
-            if let Err(e) = res {
-                error!(
-                    tx_id = %updated_tx.id,
-                    relayer_id = %updated_tx.relayer_id,
-                    status = ?updated_tx.status,
-                    error = %e,
-                    "sending transaction update notification failed for Sent state NOOP"
-                );
-            }
-            return Ok(updated_tx);
+        if should_noop && !is_noop(&tx.network_data.get_evm_transaction_data()?) {
+            return self
+                .fail_automatic_recovery(
+                    tx,
+                    reason
+                        .as_deref()
+                        .unwrap_or("automatic recovery is no longer valid"),
+                )
+                .await;
         }
 
         // Transaction was prepared but submission job may have failed
@@ -4057,7 +3922,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_circuit_breaker_submitted_triggers_noop() {
+        async fn test_circuit_breaker_submitted_preserves_intent() {
             let mut mocks = default_test_mocks();
             let relayer = create_test_relayer();
             let mut tx = make_test_transaction(TransactionStatus::Submitted);
@@ -4085,6 +3950,10 @@ mod tests {
             mocks
                 .job_producer
                 .expect_produce_submit_transaction_job()
+                .times(0);
+            mocks
+                .job_producer
+                .expect_produce_send_notification_job()
                 .returning(|_, _| Box::pin(async { Ok(()) }));
 
             let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
@@ -4096,7 +3965,11 @@ mod tests {
                 .unwrap();
 
             // NOOP processing should succeed
-            assert!(result.noop_count.is_some());
+            assert_eq!(result.status, TransactionStatus::Failed);
+            assert!(result
+                .status_reason
+                .unwrap()
+                .contains("nonce requires reconciliation"));
         }
 
         #[tokio::test]
@@ -4933,7 +4806,7 @@ mod tests {
 
         /// Test circuit breaker on Sent tx with nonce → issues NOOP + submit job
         #[tokio::test]
-        async fn test_circuit_breaker_sent_with_nonce_issues_noop() {
+        async fn test_circuit_breaker_sent_with_nonce_preserves_intent() {
             let mut mocks = default_test_mocks_with_network();
             let relayer = create_test_relayer();
 
@@ -4964,7 +4837,10 @@ mod tests {
             mocks
                 .job_producer
                 .expect_produce_submit_transaction_job()
-                .times(1)
+                .times(0);
+            mocks
+                .job_producer
+                .expect_produce_send_notification_job()
                 .returning(|_, _| Box::pin(async { Ok(()) }));
 
             let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
@@ -4975,7 +4851,13 @@ mod tests {
             let result = evm_transaction
                 .handle_circuit_breaker_safely(tx, &ctx)
                 .await;
-            assert!(result.is_ok());
+            let updated = result.unwrap();
+            assert_eq!(updated.status, TransactionStatus::Failed);
+            assert!(updated.requires_nonce_reconciliation());
+            assert_eq!(
+                updated.network_data.get_evm_transaction_data().unwrap().raw,
+                Some(vec![1, 2, 3])
+            );
         }
 
         /// Test circuit breaker on Sent tx without nonce → marks Failed

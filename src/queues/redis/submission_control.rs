@@ -178,3 +178,17 @@ pub(crate) async fn finish(
     }
     Ok(changed == 2)
 }
+
+/// A blocked control is durable. Retried deliveries must finalize the record
+/// without entering the signer/provider path again.
+pub(crate) async fn blocked_reason(
+    storage: &QueueStorage<Job<TransactionSend>>,
+    job: &TransactionSend,
+) -> Result<Option<String>, QueueBackendError> {
+    use redis::AsyncCommands;
+    let mut connection = storage.get_connection().clone();
+    connection
+        .hget(control_key(storage, job), "blocked")
+        .await
+        .map_err(|e| QueueBackendError::RedisError(e.to_string()))
+}

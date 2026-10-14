@@ -122,7 +122,11 @@ where
             .map_err(|e| RelayerError::Internal(e.to_string()))?;
 
         match tx {
-            Some(tx) if is_active_nonce_status(&tx.status) => Ok(Some(tx)),
+            Some(tx)
+                if is_active_nonce_status(&tx.status) || tx.requires_nonce_reconciliation() =>
+            {
+                Ok(Some(tx))
+            }
             _ => Ok(None),
         }
     }
@@ -192,13 +196,20 @@ where
             }
         };
 
-        let gaps: Vec<u64> = occupancy
-            .into_iter()
-            .filter(|(nonce, status)| {
-                *nonce < upper_bound && !status.as_ref().is_some_and(is_active_nonce_status)
-            })
-            .map(|(nonce, _)| nonce)
-            .collect();
+        let mut gaps = Vec::new();
+        for (nonce, status) in occupancy {
+            if nonce >= upper_bound || status.as_ref().is_some_and(is_active_nonce_status) {
+                continue;
+            }
+            // Failed automation still owns its nonce. The status-only batch scan
+            // cannot distinguish it from an ordinary on-chain failure.
+            if status == Some(TransactionStatus::Failed)
+                && self.find_active_tx_for_nonce(nonce).await?.is_some()
+            {
+                continue;
+            }
+            gaps.push(nonce);
+        }
 
         Ok(gaps)
     }
@@ -917,6 +928,9 @@ mod tests {
             ])
         });
 
+        tx_repo
+            .expect_find_by_nonce()
+            .returning(|_, _| Ok(Some(make_tx_with_status(TransactionStatus::Failed))));
         let relayer = EvmRelayer::new(
             relayer_model,
             signer,
@@ -932,6 +946,60 @@ mod tests {
 
         let gaps = relayer.detect_nonce_gaps(None, None).await.unwrap();
         assert_eq!(gaps, vec![6u64]);
+    }
+
+    #[tokio::test]
+    async fn test_detect_nonce_gaps_preserves_failed_automatic_submission() {
+        let (
+            mut provider,
+            relayer_repo,
+            network_repo,
+            mut tx_repo,
+            job_producer,
+            signer,
+            mut counter,
+        ) = setup_mocks();
+        let relayer_model = create_test_relayer();
+
+        provider
+            .expect_get_transaction_count()
+            .returning(|_| Box::pin(ready(Ok(5u64))));
+
+        counter
+            .expect_get()
+            .returning(|| Box::pin(ready(Ok(Some(8u64)))));
+
+        // nonce 5 → Submitted (active), 6 → Failed (gap), 7 → Sent (active)
+        tx_repo.expect_get_nonce_occupancy().returning(|_, _, _| {
+            Ok(vec![
+                (5, Some(TransactionStatus::Submitted)),
+                (6, Some(TransactionStatus::Failed)),
+                (7, Some(TransactionStatus::Sent)),
+            ])
+        });
+
+        tx_repo.expect_find_by_nonce().returning(|_, _| {
+            let mut tx = make_tx_with_status(TransactionStatus::Sent);
+            tx.apply_partial_update(TransactionRepoModel::automatic_submission_failure(
+                "retry budget exhausted",
+            ));
+            Ok(Some(tx))
+        });
+        let relayer = EvmRelayer::new(
+            relayer_model,
+            signer,
+            provider,
+            create_test_evm_network(),
+            Arc::new(relayer_repo),
+            Arc::new(network_repo),
+            Arc::new(tx_repo),
+            Arc::new(counter),
+            Arc::new(job_producer),
+        )
+        .unwrap();
+
+        let gaps = relayer.detect_nonce_gaps(None, None).await.unwrap();
+        assert!(gaps.is_empty(), "failed automation still owns its nonce");
     }
 
     #[tokio::test]

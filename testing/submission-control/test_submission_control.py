@@ -170,6 +170,47 @@ class SubmissionControlTests(unittest.TestCase):
         self.finish("second", "progress")
         self.assertEqual(self.command("HGET", self.keys[4], "failures"), "0")
 
+    def transaction_patch(self, transaction, patch):
+        # Execute the production atomic patch, including its final-state guards
+        # and status-index updates, against the same isolated Redis instance.
+        source = (ROOT / "src/repositories/transaction/transaction_redis.rs").read_text()
+        section = source.split("let patch_script = Script::new(", 1)[1]
+        script = section.split('r#"', 1)[1].split('"#', 1)[0]
+        lookup = self.ns + ":lookup"
+        prefix = self.ns + ":relayer:"
+        tx_key = prefix + "keeper:tx:tx"
+        self.command("SET", lookup, "keeper")
+        self.command("SET", tx_key, json.dumps(transaction))
+        statuses = ["pending", "sent", "submitted", "mined", "failed", "confirmed", "expired", "canceled"]
+        index = {"tx_id": "tx", "sorted": {x: ":status_sorted:" + x for x in statuses},
+                 "legacy": {x: ":status:" + x for x in statuses},
+                 "created_key_suffix": ":tx_by_created_at", "confirmed_score": "",
+                 "nonfinal": ["pending", "sent", "submitted", "mined"]}
+        result = self.command("EVAL", script, 1, lookup, prefix, ":tx:tx", json.dumps(patch), "2000-01-01T00:00:00Z", json.dumps(index))
+        return json.loads(result[1]), tx_key
+
+    def test_terminal_failure_atomically_preserves_intent_and_nonce(self):
+        tx = {"status": "sent", "status_reason": None, "delete_at": None,
+              "network_data": {"type": "evm", "data": {"nonce": 117480, "to": "vault", "data": "vote", "raw": [1, 2, 3]}}, "hashes": ["original"]}
+        failed, key = self.transaction_patch(tx, {"status": "failed", "status_reason": "Automatic submission failed: intrinsic gas too low; nonce requires reconciliation"})
+        self.assertEqual(failed["network_data"], tx["network_data"])
+        self.assertEqual(failed["hashes"], tx["hashes"])
+        self.assertEqual(self.command("ZSCORE", self.ns + ":relayer:keeper:status_sorted:failed", "tx"), "0")
+        for patch in [{"status": "submitted"}, {"network_data": {"type": "evm", "data": {"nonce": 117480, "data": "noop"}}}, {"status_reason": "late worker", "hashes": ["bad"]}]:
+            result, _ = self.transaction_patch(failed, patch)
+            self.assertEqual(result, failed)
+
+    def test_mined_transaction_cannot_be_overwritten_by_terminal_retry(self):
+        tx = {"status": "mined", "status_reason": None, "hashes": ["mined"]}
+        result, _ = self.transaction_patch(tx, {"status": "failed", "status_reason": "Automatic submission failed: late retry; nonce requires reconciliation"})
+        self.assertEqual(result, tx)
+
+    def test_replacement_candidate_cannot_overwrite_mined_or_confirmed_hash(self):
+        for status in ["mined", "confirmed"]:
+            tx = {"status": status, "status_reason": None, "hashes": ["mined"], "network_data": {"data": {"hash": "mined", "nonce": 117480}}}
+            result, _ = self.transaction_patch(tx, {"hashes": ["mined", "unsigned-candidate"], "network_data": {"data": {"hash": "unsigned-candidate", "nonce": 117480}}})
+            self.assertEqual(result, tx)
+
     def test_invalid_queue_type_does_not_claim_or_write_a_job(self):
         self.command("SET", self.keys[1], "wrong-type")
         with self.assertRaises(RuntimeError):

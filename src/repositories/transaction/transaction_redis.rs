@@ -2120,7 +2120,19 @@ impl TransactionRepository for RedisTransactionRepository {
             -- A stale worker must not resurrect a tx that another worker
             -- already moved to a terminal state.
             local final_states = {confirmed=true, failed=true, expired=true, canceled=true}
-            if final_states[tx["status"]] and patch["status"] then
+            local failure_prefix = 'Automatic submission failed: '
+            local reason = tx["status_reason"]
+            local preserved_failure = tx["status"] == 'failed'
+                and type(reason) == 'string'
+                and string.sub(reason, 1, #failure_prefix) == failure_prefix
+            local patch_reason = patch["status_reason"]
+            local automation_failure = type(patch_reason) == 'string'
+                and string.sub(patch_reason, 1, #failure_prefix) == failure_prefix
+            if preserved_failure
+                or (final_states[tx["status"]] and patch["status"])
+                or (tx["status"] == 'mined' and automation_failure)
+                or ((tx["status"] == 'mined' or final_states[tx["status"]])
+                    and patch["network_data"] and patch["hashes"]) then
                 return {current, current}
             end
 

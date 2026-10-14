@@ -142,6 +142,16 @@ where
                 return Ok(());
             }
 
+            // A blocked enqueue may be recovered from a durable ACK after a
+            // worker crash. Finalize that failure here even if no submission
+            // delivery remains to update the record.
+            if e.to_string().contains("Automatic submission failed:") {
+                super::persist_automatic_submission_failure(tx_repo, tx_id, &e.to_string())
+                    .await
+                    .map_err(|error| HandlerError::Retry(error.to_string()))?;
+                return Ok(());
+            }
+
             // Transient error - INCREMENT both counters (only if we have metadata)
             if let Some(meta) = metadata {
                 warn!(

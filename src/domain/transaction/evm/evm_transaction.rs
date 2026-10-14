@@ -941,11 +941,10 @@ where
                 let error_kind = Self::classify_submission_error(&e);
 
                 match (&tx.status, &error_kind) {
-                    // AlreadyKnown / ReplacementUnderpriced (any status):
+                    // AlreadyKnown (any status):
                     // The node recognizes the exact same transaction bytes (same hash)
                     // in its mempool — this confirms it's our tx. Safe to treat as submitted.
-                    (_, SubmissionErrorKind::AlreadyKnown)
-                    | (_, SubmissionErrorKind::ReplacementUnderpriced) => {
+                    (_, SubmissionErrorKind::AlreadyKnown) => {
                         warn!(
                             tx_id = %tx.id,
                             error = %e,
@@ -1161,6 +1160,38 @@ where
             TransactionError::InvalidType("Raw transaction data is missing".to_string())
         })?;
 
+        // Persist the signed candidate before any broadcast. A timeout or crash
+        // must leave both old and replacement hashes available for reconciliation.
+        let mut candidate_hashes = tx.hashes.clone();
+        if let Some(hash) = tx.network_data.get_evm_transaction_data()?.hash {
+            if !candidate_hashes.contains(&hash) {
+                candidate_hashes.push(hash);
+            }
+        }
+        if let Some(hash) = final_evm_data.hash.clone() {
+            if !candidate_hashes.contains(&hash) {
+                candidate_hashes.push(hash);
+            }
+        }
+        let tx = self
+            .transaction_repository
+            .partial_update(
+                tx.id.clone(),
+                TransactionUpdateRequest {
+                    network_data: Some(NetworkTransactionData::Evm(final_evm_data.clone())),
+                    hashes: Some(candidate_hashes),
+                    priced_at: Some(Utc::now().to_rfc3339()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if !matches!(
+            tx.status,
+            TransactionStatus::Sent | TransactionStatus::Submitted
+        ) {
+            return Ok(tx);
+        }
+
         // Send resubmitted transaction to blockchain - this is the critical operation
         let was_already_submitted = match self.provider.send_raw_transaction(raw_tx).await {
             Ok(_) => {
@@ -1171,9 +1202,8 @@ where
                 let error_kind = Self::classify_submission_error(&e);
 
                 match &error_kind {
-                    // AlreadyKnown / ReplacementUnderpriced: existing behavior — keep original hash
-                    SubmissionErrorKind::AlreadyKnown
-                    | SubmissionErrorKind::ReplacementUnderpriced => {
+                    // AlreadyKnown: the candidate is known to the node.
+                    SubmissionErrorKind::AlreadyKnown => {
                         warn!(
                             tx_id = %tx.id,
                             error = %e,
@@ -1235,7 +1265,9 @@ where
             // Transaction resubmitted successfully - update with new hash and pricing
             let mut hashes = tx.hashes.clone();
             if let Some(hash) = final_evm_data.hash.clone() {
-                hashes.push(hash);
+                if !hashes.contains(&hash) {
+                    hashes.push(hash);
+                }
             }
 
             TransactionUpdateRequest {
@@ -3639,7 +3671,7 @@ mod tests {
     /// Test resubmit_transaction when transaction is already submitted
     /// Should NOT update hash, only status
     #[tokio::test]
-    async fn test_resubmit_transaction_already_submitted_preserves_hash() {
+    async fn test_resubmit_transaction_already_known_retains_both_hashes() {
         let mut mock_transaction = MockTransactionRepository::new();
         let mock_relayer = MockRelayerRepository::new();
         let mut mock_provider = MockEvmProviderTrait::new();
@@ -3691,7 +3723,7 @@ mod tests {
                 Box::pin(ready(Ok(
                     crate::domain::relayer::SignTransactionResponse::Evm(
                         crate::domain::relayer::SignTransactionResponseEvm {
-                            hash: "0xnew_hash_that_should_not_be_saved".to_string(),
+                            hash: "0xknown_candidate_hash".to_string(),
                             signature: crate::models::EvmTransactionDataSignature {
                                 r: "r".to_string(),
                                 s: "s".to_string(),
@@ -3717,7 +3749,26 @@ mod tests {
             });
 
         // Verify that partial_update is called with NO network_data (preserving original hash)
-        let test_tx_clone = test_tx.clone();
+        // Signed replacement is durable before the provider is called.
+        let candidate_snapshot = test_tx.clone();
+        mock_transaction
+            .expect_partial_update()
+            .withf(|_, update| {
+                update.status.is_none() && update.network_data.is_some() && update.hashes.is_some()
+            })
+            .times(1)
+            .returning(move |_, update| {
+                let mut saved = candidate_snapshot.clone();
+                saved.apply_partial_update(update);
+                Ok(saved)
+            });
+
+        let mut test_tx_clone = test_tx.clone();
+        if let NetworkTransactionData::Evm(ref mut data) = test_tx_clone.network_data {
+            data.hash = Some("0xknown_candidate_hash".into());
+            data.raw = Some(vec![4, 5, 6]);
+        }
+        test_tx_clone.hashes.push("0xknown_candidate_hash".into());
         mock_transaction
             .expect_partial_update()
             .times(1)
@@ -3752,7 +3803,8 @@ mod tests {
 
         // Verify hash was NOT changed
         if let NetworkTransactionData::Evm(evm_data) = &updated_tx.network_data {
-            assert_eq!(evm_data.hash, Some(original_hash));
+            assert_eq!(evm_data.hash, Some("0xknown_candidate_hash".into()));
+            assert!(updated_tx.hashes.contains(&original_hash));
         } else {
             panic!("Expected EVM network data");
         }
@@ -4076,6 +4128,20 @@ mod tests {
             .returning(|_| Box::pin(async { Ok("0xnew_hash".to_string()) }));
 
         // Should update to Submitted status with new hash
+        // Signed replacement is durable before the provider is called.
+        let candidate_snapshot = test_tx.clone();
+        mock_transaction
+            .expect_partial_update()
+            .withf(|_, update| {
+                update.status.is_none() && update.network_data.is_some() && update.hashes.is_some()
+            })
+            .times(1)
+            .returning(move |_, update| {
+                let mut saved = candidate_snapshot.clone();
+                saved.apply_partial_update(update);
+                Ok(saved)
+            });
+
         let test_tx_clone = test_tx.clone();
         mock_transaction
             .expect_partial_update()
@@ -4493,6 +4559,20 @@ mod tests {
             .returning(|_, _| Box::pin(ready(Ok(()))));
 
         // Should update status without changing hash (was_already_submitted = true)
+        // Signed replacement is durable before the provider is called.
+        let candidate_snapshot = test_tx.clone();
+        mock_transaction
+            .expect_partial_update()
+            .withf(|_, update| {
+                update.status.is_none() && update.network_data.is_some() && update.hashes.is_some()
+            })
+            .times(1)
+            .returning(move |_, update| {
+                let mut saved = candidate_snapshot.clone();
+                saved.apply_partial_update(update);
+                Ok(saved)
+            });
+
         let test_tx_clone = test_tx.clone();
         mock_transaction
             .expect_partial_update()
@@ -4771,6 +4851,20 @@ mod tests {
             });
 
         // Should persist incremented counter (nonce_too_high_retries = 1) in metadata
+        // Signed replacement is durable before the provider is called.
+        let candidate_snapshot = test_tx.clone();
+        mock_transaction
+            .expect_partial_update()
+            .withf(|_, update| {
+                update.status.is_none() && update.network_data.is_some() && update.hashes.is_some()
+            })
+            .times(1)
+            .returning(move |_, update| {
+                let mut saved = candidate_snapshot.clone();
+                saved.apply_partial_update(update);
+                Ok(saved)
+            });
+
         let test_tx_clone = test_tx.clone();
         mock_transaction
             .expect_partial_update()

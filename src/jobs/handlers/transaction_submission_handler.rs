@@ -15,12 +15,13 @@ use crate::{
         WORKER_TRANSACTION_CANCEL_RETRIES, WORKER_TRANSACTION_RESEND_RETRIES,
         WORKER_TRANSACTION_RESUBMIT_RETRIES, WORKER_TRANSACTION_SUBMIT_RETRIES,
     },
-    domain::{get_relayer_transaction, get_transaction_by_id, Transaction},
+    domain::{get_relayer_transaction, get_transaction_by_id, is_final_state, Transaction},
     jobs::{handle_result, Job, JobProducerTrait, TransactionCommand, TransactionSend},
     metrics::{observe_processing_time, STAGE_SUBMISSION_QUEUE_DWELL, STAGE_SUBMIT_DURATION},
-    models::{DefaultAppState, TransactionRepoModel, TransactionStatus},
+    models::{DefaultAppState, RepositoryError, TransactionRepoModel, TransactionStatus},
     observability::request_id::set_request_id,
     queues::{redis::submission_control, HandlerError, WorkerContext},
+    repositories::TransactionRepository,
 };
 
 #[instrument(
@@ -61,6 +62,32 @@ pub async fn transaction_submission_handler(
         task_id = %ctx.task_id,
         "submission job picked up"
     );
+    if submission_control::applies(&submission) {
+        if let Some(queue) = state
+            .job_producer
+            .get_queue_backend()
+            .and_then(|b| b.queue().cloned())
+        {
+            let blocked = submission_control::blocked_reason(
+                &queue.transaction_submission_queue,
+                &submission,
+            )
+            .await
+            .map_err(|e| HandlerError::Retry(e.to_string()))?;
+            if let Some(reason) = blocked {
+                persist_automatic_submission_failure(
+                    &*state.transaction_repository(),
+                    &submission.transaction_id,
+                    &reason,
+                )
+                .await
+                .map_err(|e| HandlerError::Retry(e.to_string()))?;
+                return Err(HandlerError::Abort(format!(
+                    "Automatic submission failed: {reason}; nonce requires reconciliation"
+                )));
+            }
+        }
+    }
     let mut result = handle_request(job.data, &state, &job_timestamp).await;
 
     // Only guarded messages carry the owning Apalis task ID. Legacy messages
@@ -99,6 +126,16 @@ pub async fn transaction_submission_handler(
                         .unwrap_or_else(|| {
                             "retry budget exhausted without submission progress".to_string()
                         });
+                    // Persist terminal status before ending the job. A repository
+                    // failure retries this delivery; its blocked control prevents
+                    // another broadcast on that retry.
+                    persist_automatic_submission_failure(
+                        &*state.transaction_repository(),
+                        &submission.transaction_id,
+                        &reason,
+                    )
+                    .await
+                    .map_err(|e| HandlerError::Retry(e.to_string()))?;
                     return Err(HandlerError::Abort(format!(
                         "Automatic submission failed: {reason}; nonce requires reconciliation"
                     )));
@@ -111,6 +148,32 @@ pub async fn transaction_submission_handler(
             }
         }
         result = require_submission_progress(result);
+        // finish released this delivery's reservation. End this job; only a
+        // fresh status-driven job may retry after the shared cooldown. Retrying
+        // this old Apalis delivery could race a newly reserved owner.
+        return result
+            .map(|_| ())
+            .map_err(|e| HandlerError::Abort(e.to_string()));
+    }
+
+    if submission_control::applies(&submission)
+        && result.is_err()
+        && (ctx.attempt >= get_max_retries(&command)
+            || result.as_ref().err().is_some_and(|e| {
+                e.to_string()
+                    .to_lowercase()
+                    .contains("intrinsic gas too low")
+            }))
+    {
+        let reason = result.as_ref().unwrap_err().to_string();
+        persist_automatic_submission_failure(
+            &*state.transaction_repository(),
+            &submission.transaction_id,
+            &reason,
+        )
+        .await
+        .map_err(|e| HandlerError::Retry(e.to_string()))?;
+        return Err(HandlerError::Abort(reason));
     }
 
     // Handle result with command-specific retry logic
@@ -120,6 +183,34 @@ pub async fn transaction_submission_handler(
         "Transaction Submission",
         get_max_retries(&command),
     )
+}
+
+/// End automatic recovery without changing intent, signatures, hashes or nonce.
+/// Repository guards keep a concurrent mined/final result authoritative.
+pub async fn persist_automatic_submission_failure<TR: TransactionRepository + Send + Sync>(
+    repository: &TR,
+    transaction_id: &str,
+    reason: &str,
+) -> Result<TransactionRepoModel, RepositoryError> {
+    repository
+        .partial_update(
+            transaction_id.to_string(),
+            TransactionRepoModel::automatic_submission_failure(reason),
+        )
+        .await
+}
+
+/// Only definite fee rejections permit an immediate same-nonce replacement.
+pub fn is_fee_repricing_error(message: &str) -> bool {
+    let message = message.to_lowercase();
+    [
+        "max fee per gas less than block base fee",
+        "fee cap less than block base fee",
+        "gas price too low",
+        "transaction underpriced",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
 }
 
 fn require_submission_progress(result: Result<bool>) -> Result<bool> {
@@ -150,6 +241,10 @@ async fn handle_request(
         get_relayer_transaction(status_request.relayer_id.clone(), state).await?;
 
     let transaction = get_transaction_by_id(status_request.transaction_id, state).await?;
+
+    if is_final_state(&transaction.status) || transaction.status == TransactionStatus::Mined {
+        return Ok(true);
+    }
 
     // Capture transaction info for completion log
     let tx_id = transaction.id.clone();
@@ -183,7 +278,23 @@ async fn handle_request(
     let previous = transaction.clone();
 
     let updated = match status_request.command {
-        TransactionCommand::Submit => relayer_transaction.submit_transaction(transaction).await?,
+        TransactionCommand::Submit | TransactionCommand::Resend => {
+            match relayer_transaction
+                .submit_transaction(transaction.clone())
+                .await
+            {
+                Ok(updated) => updated,
+                Err(error) if is_fee_repricing_error(&error.to_string()) => {
+                    // A definite fee rejection can be repriced immediately using
+                    // the same intent and nonce. Timeouts and unknown outcomes
+                    // never enter this path.
+                    relayer_transaction
+                        .resubmit_transaction(transaction)
+                        .await?
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         TransactionCommand::Cancel { reason } => {
             info!(
                 tx_id = %tx_id,
@@ -202,14 +313,6 @@ async fn handle_request(
             relayer_transaction
                 .resubmit_transaction(transaction)
                 .await?
-        }
-        TransactionCommand::Resend => {
-            debug!(
-                tx_id = %tx_id,
-                relayer_id = %relayer_id,
-                "resending transaction"
-            );
-            relayer_transaction.submit_transaction(transaction).await?
         }
     };
 
