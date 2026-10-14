@@ -119,11 +119,21 @@ async fn main() -> Result<()> {
 
     let app_state = initialize_app_state(server_config.clone()).await?;
 
-    process_config_file(config_file, server_config.clone(), &app_state).await?;
-
-    info!("Initializing relayers");
-    // Initialize relayers: sync and validate relayers
-    initialize_relayers(app_state.clone()).await?;
+    // Fail closed on an invalid maintenance setting.
+    let read_only = match env::var("RELAYER_READ_ONLY") {
+        Ok(value) => value
+            .parse::<bool>()
+            .wrap_err("RELAYER_READ_ONLY must be true or false")?,
+        Err(env::VarError::NotPresent) => false,
+        Err(error) => return Err(error.into()),
+    };
+    info!(read_only, "Resolved read-only maintenance mode");
+    if !read_only {
+        process_config_file(config_file, server_config.clone(), &app_state).await?;
+        info!("Initializing relayers");
+        // Initialize relayers: sync and validate relayers
+        initialize_relayers(app_state.clone()).await?;
+    }
 
     // Resolve the worker-thread budget and build an explicit multi-thread tokio
     // runtime for the background transaction pipeline (queue workers, tx
@@ -161,14 +171,19 @@ async fn main() -> Result<()> {
 
     // Setup workers for processing jobs using the configured queue backend,
     // spawned onto the pipeline runtime. Handles are joined on shutdown (below).
-    let worker_handles =
-        initialize_queue_workers(app_state.clone(), pipeline_handle.clone()).await?;
+    let worker_handles = if read_only {
+        info!("Read-only maintenance: relayer initialization and all queue workers disabled");
+        Vec::new()
+    } else {
+        initialize_queue_workers(app_state.clone(), pipeline_handle.clone()).await?
+    };
 
     // Initialize plugin worker pool (enabled by default for better performance)
     // Set PLUGIN_USE_POOL=false to use legacy ts-node mode
-    let pool_manager = if std::env::var("PLUGIN_USE_POOL")
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(true)
+    let pool_manager = if !read_only
+        && std::env::var("PLUGIN_USE_POOL")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(true)
     {
         info!("Pool-based plugin execution enabled, initializing plugin pool");
         match initialize_plugin_pool(app_state.plugin_repository.as_ref()).await {
@@ -235,7 +250,13 @@ async fn main() -> Result<()> {
             .wrap(api::middleware::ConcurrencyLimiter::new(config.relayer_concurrency_limit))
             .wrap(api::middleware::TimeoutMiddleware::new(config.request_timeout_seconds))
             .app_data(app_state.clone())
-            .service(web::scope("/api/v1").configure(api::routes::configure_routes))
+            .service(web::scope("/api/v1").configure(move |cfg| {
+                if read_only {
+                    api::routes::configure_read_only_routes(cfg);
+                } else {
+                    api::routes::configure_routes(cfg);
+                }
+            }))
         }
     })
     .bind((config.host.as_str(), config.port))

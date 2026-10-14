@@ -216,6 +216,53 @@ async fn build_sponsored_transaction(
 }
 
 /// Initializes the routes for the relayer module.
+pub fn init_read_only(cfg: &mut web::ServiceConfig) {
+    cfg.service(list_relayers)
+        .service(get_relayer)
+        .service(get_transaction_by_nonce)
+        .service(get_transaction_by_id)
+        .service(list_transactions)
+        .route("/relayers/{relayer_id}/rpc", web::post().to(read_only_rpc));
+}
+
+/// Strict maintenance allowlist: batches and every unlisted method fail closed.
+pub fn is_read_only_rpc(request: &serde_json::Value) -> bool {
+    request.is_object()
+        && matches!(
+            request.get("method").and_then(|v| v.as_str()),
+            Some(
+                "eth_chainId"
+                    | "eth_blockNumber"
+                    | "eth_getBalance"
+                    | "eth_getTransactionCount"
+                    | "eth_getTransactionByHash"
+                    | "eth_getTransactionReceipt"
+                    | "eth_getBlockByNumber"
+                    | "eth_getBlockByHash"
+                    | "eth_getCode"
+                    | "eth_getStorageAt"
+            )
+        )
+}
+
+async fn read_only_rpc(
+    relayer_id: web::Path<String>,
+    req: web::Json<serde_json::Value>,
+    data: web::ThinData<DefaultAppState>,
+) -> Result<actix_web::HttpResponse, crate::models::ApiError> {
+    if !is_read_only_rpc(&req) {
+        return Ok(super::maintenance_unavailable().await);
+    }
+    // Reads remain available for paused relayers. Do not modify persisted pause
+    // state merely to diagnose their nonce or chain configuration.
+    use crate::domain::{get_network_relayer_by_model, get_relayer_by_id, Relayer};
+    let model = get_relayer_by_id(relayer_id.into_inner(), &data).await?;
+    let request =
+        crate::models::convert_to_internal_rpc_request(req.into_inner(), &model.network_type)?;
+    let network = get_network_relayer_by_model(model, &data).await?;
+    Ok(actix_web::HttpResponse::Ok().json(network.rpc(request).await?))
+}
+
 pub fn init(cfg: &mut web::ServiceConfig) {
     // Register routes with literal segments before routes with path parameters
     cfg.service(delete_pending_transactions); // /relayers/{id}/transactions/pending

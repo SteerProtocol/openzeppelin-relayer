@@ -20,6 +20,23 @@ pub mod relayer;
 pub mod signer;
 
 use actix_web::web;
+
+/// Exposes only reads during maintenance. No plugin, signer, or mutation routes
+/// are registered, so an API restart cannot accept new execution work.
+pub fn configure_read_only_routes(cfg: &mut web::ServiceConfig) {
+    cfg.configure(health::init)
+        .configure(relayer::init_read_only)
+        .default_service(web::route().to(maintenance_unavailable));
+}
+
+pub async fn maintenance_unavailable() -> actix_web::HttpResponse {
+    actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+        "success": false,
+        "error": "RELAYER_READ_ONLY",
+        "message": "Relayer execution is held for maintenance; only read access is available"
+    }))
+}
+
 pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.configure(health::init)
         .configure(relayer::init)
