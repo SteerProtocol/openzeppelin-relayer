@@ -181,14 +181,16 @@ pub(crate) async fn finish(
 
 /// A blocked control is durable. Retried deliveries must finalize the record
 /// without entering the signer/provider path again.
-pub(crate) async fn blocked_reason(
+pub(crate) async fn reservation_state(
     storage: &QueueStorage<Job<TransactionSend>>,
     job: &TransactionSend,
-) -> Result<Option<String>, QueueBackendError> {
-    use redis::AsyncCommands;
+) -> Result<(Option<String>, Option<String>), QueueBackendError> {
     let mut connection = storage.get_connection().clone();
-    connection
-        .hget(control_key(storage, job), "blocked")
+    redis::cmd("HMGET")
+        .arg(control_key(storage, job))
+        .arg("owner")
+        .arg("blocked")
+        .query_async(&mut connection)
         .await
         .map_err(|e| QueueBackendError::RedisError(e.to_string()))
 }

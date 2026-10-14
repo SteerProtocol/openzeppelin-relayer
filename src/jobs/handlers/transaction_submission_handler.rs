@@ -68,7 +68,7 @@ pub async fn transaction_submission_handler(
             .get_queue_backend()
             .and_then(|b| b.queue().cloned())
         {
-            let blocked = submission_control::blocked_reason(
+            let (owner, blocked) = submission_control::reservation_state(
                 &queue.transaction_submission_queue,
                 &submission,
             )
@@ -85,6 +85,11 @@ pub async fn transaction_submission_handler(
                 return Err(HandlerError::Abort(format!(
                     "Automatic submission failed: {reason}; nonce requires reconciliation"
                 )));
+            }
+            if !owns_submission_reservation(&submission, &ctx.task_id, owner.as_deref()) {
+                return Err(HandlerError::Abort(
+                    "Stale submission delivery no longer owns its reservation".into(),
+                ));
             }
         }
     }
@@ -198,6 +203,23 @@ pub async fn persist_automatic_submission_failure<TR: TransactionRepository + Se
             TransactionRepoModel::automatic_submission_failure(reason),
         )
         .await
+}
+
+/// Reject old/crashed deliveries once a fresh task owns automatic recovery.
+/// Legacy jobs can execute only when no guarded reservation is present.
+pub fn owns_submission_reservation(
+    job: &TransactionSend,
+    task_id: &str,
+    owner: Option<&str>,
+) -> bool {
+    match job
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get(submission_control::OWNER_METADATA))
+    {
+        Some(expected) => expected == task_id && owner == Some(task_id),
+        None => owner.is_none(),
+    }
 }
 
 /// Only definite fee rejections permit an immediate same-nonce replacement.

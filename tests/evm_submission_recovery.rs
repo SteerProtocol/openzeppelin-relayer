@@ -309,3 +309,19 @@ fn cleanup_retains_unresolved_nonce_owner_but_expires_normal_failures() {
     tx.status_reason = Some("On-chain transaction reverted".into());
     assert!(should_delete_transaction(&tx, chrono::Utc::now()));
 }
+
+#[test]
+fn stale_deliveries_cannot_broadcast_after_reservation_ownership_changes() {
+    use openzeppelin_relayer::jobs::{owns_submission_reservation, TransactionSend};
+    let job =
+        TransactionSend::resubmit("tx", "keeper").with_metadata(std::collections::HashMap::from([
+            ("redis_submission_owner".into(), "old".into()),
+        ]));
+    assert!(owns_submission_reservation(&job, "old", Some("old")));
+    assert!(!owns_submission_reservation(&job, "old", Some("new")));
+    assert!(!owns_submission_reservation(&job, "old", None));
+    assert!(!owns_submission_reservation(&job, "new", Some("new")));
+    let legacy = TransactionSend::resubmit("tx", "keeper");
+    assert!(owns_submission_reservation(&legacy, "legacy", None));
+    assert!(!owns_submission_reservation(&legacy, "legacy", Some("new")));
+}
