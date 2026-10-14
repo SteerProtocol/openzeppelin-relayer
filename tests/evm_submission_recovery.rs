@@ -325,3 +325,27 @@ fn stale_deliveries_cannot_broadcast_after_reservation_ownership_changes() {
     assert!(owns_submission_reservation(&legacy, "legacy", None));
     assert!(!owns_submission_reservation(&legacy, "legacy", Some("new")));
 }
+
+#[tokio::test]
+async fn redis_tls_setup_returns_an_error_instead_of_panicking_on_a_closed_peer() {
+    // A real local TCP peer reaches Redis's TLS client construction. This caught
+    // the ambiguous Rustls CryptoProvider startup panic in the wrong build mode.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(stream);
+    });
+    let client = redis::Client::open(format!("rediss://{address}")).unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.get_multiplexed_async_connection(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        result.is_err(),
+        "a closed TLS peer must fail without a provider-selection panic"
+    );
+    peer.await.unwrap();
+}

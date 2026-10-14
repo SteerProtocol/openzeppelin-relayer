@@ -34,8 +34,12 @@ expired actions or restore quarantined jobs blindly.
 Run isolated regressions with:
 
 ```sh
-cargo test --release --test evm_submission_recovery --locked --features redis-tls-rustls
+cargo test --release --test evm_submission_recovery --locked --features redis-tls-native
 python3 testing/submission-control/test_submission_control.py
 ```
 
 These tests do not submit transactions to production networks.
+
+The production image uses `redis-tls-native`, matching the existing runtime.
+The local closed-TLS-peer regression exercises real Redis TLS setup and must
+return a connection error rather than panic during provider selection.
