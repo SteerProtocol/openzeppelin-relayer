@@ -1943,7 +1943,7 @@ impl TransactionRepository for RedisTransactionRepository {
         nonce: u64,
     ) -> Result<Option<TransactionRepoModel>, RepositoryError> {
         let mut conn = self
-            .get_connection(self.connections.reader(), "find_by_nonce")
+            .get_connection(self.connections.primary(), "find_by_nonce")
             .await?;
         let nonce_key = self.relayer_nonce_key(relayer_id, nonce);
 
@@ -1953,17 +1953,19 @@ impl TransactionRepository for RedisTransactionRepository {
             .await
             .map_err(|e| self.map_redis_error(e, "find_by_nonce"))?;
 
+        // Nonce ownership is a safety decision. Read both index and record
+        // from the primary; replica lag must never make a reserved slot empty.
         match tx_id {
             Some(tx_id) => {
-                match self.get_by_id(tx_id.clone()).await {
-                    Ok(tx) => Ok(Some(tx)),
-                    Err(RepositoryError::NotFound(_)) => {
-                        // Transaction was deleted but index wasn't cleaned up
-                        warn!(relayer_id = %relayer_id, nonce = %nonce, "stale nonce index found for relayer");
-                        Ok(None)
-                    }
-                    Err(e) => Err(e),
-                }
+                let key = self.tx_key(relayer_id, &tx_id);
+                let raw: Option<String> = conn
+                    .get(key)
+                    .await
+                    .map_err(|e| self.map_redis_error(e, "find_by_nonce:transaction"))?;
+                raw.map(|json| {
+                    self.deserialize_entity::<TransactionRepoModel>(&json, &tx_id, "transaction")
+                })
+                .transpose()
             }
             None => Ok(None),
         }
