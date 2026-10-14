@@ -326,6 +326,7 @@ fn stale_deliveries_cannot_broadcast_after_reservation_ownership_changes() {
     assert!(!owns_submission_reservation(&legacy, "legacy", Some("new")));
 }
 
+#[cfg(any(feature = "redis-tls-native", feature = "redis-tls-rustls"))]
 #[tokio::test]
 async fn redis_tls_setup_returns_an_error_instead_of_panicking_on_a_closed_peer() {
     // A real local TCP peer reaches Redis's TLS client construction. This caught
