@@ -43,3 +43,24 @@ These tests do not submit transactions to production networks.
 The production image uses `redis-tls-native`, matching the existing runtime.
 The local closed-TLS-peer regression exercises real Redis TLS setup and must
 return a connection error rather than panic during provider selection.
+
+## Polygon automatic gas estimation
+
+For transactions without a supplied gas limit, the relayer adds 50% to the RPC
+estimate on Polygon (chain ID 137), rounding upward. Other chains retain their
+10% margin. The previous 10% margin could produce an 82,051 gas vote limit even
+though a concurrent keeper vote consumed 91,657 gas; changing contract state
+between simulation and mining can invalidate a close estimate. This margin is
+headroom, not a guarantee that every vote will succeed.
+
+The selected limit is used for fee/balance checks, persisted before signing and
+signed with the allocated nonce. Explicit caller limits, including guarded-plugin
+budgets, remain unchanged. This only affects newly prepared automatic estimates;
+mined failures and existing signed transactions are not replayed or rewritten.
+
+Targeted regressions (no live RPC or transaction submissions):
+
+```sh
+cargo test --release --test polygon_gas_estimation --locked --features redis-tls-native
+cargo test --release --lib test_prepare_transaction_ --locked --features redis-tls-native
+```

@@ -11,6 +11,27 @@ use crate::services::provider::EvmProviderTrait;
 use chrono::{DateTime, Duration, Utc};
 use eyre::Result;
 
+/// Apply the relayer-owned margin to an automatic RPC gas estimate.
+pub fn buffered_gas_estimate(chain_id: u64, estimated_gas: u64) -> Result<u64, TransactionError> {
+    // Concurrent Polygon votes can change the storage/approval path after estimation.
+    // Keep this margin in the relayer; explicit caller/plugin limits bypass estimation.
+    let multiplier = if chain_id == 137 {
+        crate::constants::POLYGON_GAS_LIMIT_BUFFER_MULTIPLIER
+    } else {
+        crate::constants::GAS_LIMIT_BUFFER_MULTIPLIER
+    };
+    let scaled = u128::from(estimated_gas) * u128::from(multiplier);
+    let buffered = if chain_id == 137 {
+        scaled.div_ceil(100)
+    } else {
+        // Preserve the existing rounding on other chains.
+        scaled / 100
+    };
+    u64::try_from(buffered).map_err(|_| {
+        TransactionError::ValidationError("Buffered gas estimate exceeds u64".to_string())
+    })
+}
+
 /// Updates an existing transaction to be a "noop" transaction (transaction to self with zero value and no data)
 /// This is commonly used for cancellation and replacement transactions
 /// For Arbitrum networks, uses eth_estimateGas to account for L1 + L2 costs

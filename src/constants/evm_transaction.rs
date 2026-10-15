@@ -17,6 +17,9 @@ pub const GAS_TX_DATA_NONZERO: u64 = 16; // Cost per non-zero byte in data
 /// Gas limit buffer multiplier for automatic gas limit estimation, 10% increase
 pub const GAS_LIMIT_BUFFER_MULTIPLIER: u64 = 110;
 
+/// Polygon automatic estimates need more headroom for concurrent contract state changes.
+pub const POLYGON_GAS_LIMIT_BUFFER_MULTIPLIER: u64 = 150;
+
 /// Minimum gas price bump factor for transaction replacements (10% increase)
 pub const MIN_BUMP_FACTOR: f64 = 1.1;
 

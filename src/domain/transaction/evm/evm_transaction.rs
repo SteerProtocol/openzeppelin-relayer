@@ -13,13 +13,16 @@ use tracing::{debug, error, info, warn};
 use crate::{
     constants::{
         matches_known_transaction, ALREADY_SUBMITTED_PATTERNS, DEFAULT_EVM_GAS_LIMIT_ESTIMATION,
-        DEFAULT_EVM_STATUS_CHECK_RETRY_DELAY_SECONDS, GAS_LIMIT_BUFFER_MULTIPLIER,
-        KNOWN_ARBITRUM_CHAIN_IDS, MAX_NONCE_TOO_HIGH_RETRIES, NONCE_TOO_HIGH_PATTERNS,
+        DEFAULT_EVM_STATUS_CHECK_RETRY_DELAY_SECONDS, KNOWN_ARBITRUM_CHAIN_IDS,
+        MAX_NONCE_TOO_HIGH_RETRIES, NONCE_TOO_HIGH_PATTERNS,
     },
     domain::{
         evm::is_noop,
         transaction::{
-            evm::{ensure_status, ensure_status_one_of, PriceCalculator, PriceCalculatorTrait},
+            evm::{
+                buffered_gas_estimate, ensure_status, ensure_status_one_of, PriceCalculator,
+                PriceCalculatorTrait,
+            },
             Transaction,
         },
         EvmTransactionValidationError, EvmTransactionValidator,
@@ -625,7 +628,12 @@ where
             TransactionError::UnexpectedError(format!("Failed to estimate gas: {e}"))
         })?;
 
-        Ok(estimated_gas * GAS_LIMIT_BUFFER_MULTIPLIER / 100)
+        let gas_limit = buffered_gas_estimate(evm_data.chain_id, estimated_gas)?;
+        info!(
+            chain_id = evm_data.chain_id,
+            estimated_gas, gas_limit, "selected automatic gas limit"
+        );
+        Ok(gas_limit)
     }
 }
 
@@ -3053,6 +3061,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_transaction_uses_gas_estimation_and_stores_result() {
+        assert_prepared_gas_limit(1, 45000, 49500).await;
+        assert_prepared_gas_limit(137, 74592, 111888).await;
+    }
+
+    async fn assert_prepared_gas_limit(chain_id: u64, estimate: u64, expected: u64) {
         let mut mock_transaction = MockTransactionRepository::new();
         let mock_relayer = MockRelayerRepository::new();
         let mut mock_provider = MockEvmProviderTrait::new();
@@ -3072,19 +3085,20 @@ mod tests {
         // Create test transaction WITHOUT gas_limit (so estimation will be triggered)
         let mut test_tx = create_test_transaction();
         if let NetworkTransactionData::Evm(ref mut evm_data) = test_tx.network_data {
+            evm_data.chain_id = chain_id;
             evm_data.gas_limit = None; // This should trigger gas estimation
             evm_data.nonce = None; // This will be set by the counter service
         }
 
         // Expected estimated gas from provider
-        const PROVIDER_GAS_ESTIMATE: u64 = 45000;
-        const EXPECTED_GAS_WITH_BUFFER: u64 = 49500; // 45000 * 110 / 100
+        let provider_gas_estimate = estimate;
+        let expected_gas_with_buffer = expected;
 
         // Mock provider to return specific gas estimate
         mock_provider
             .expect_estimate_gas()
             .times(1)
-            .returning(move |_| Box::pin(async move { Ok(PROVIDER_GAS_ESTIMATE) }));
+            .returning(move |_| Box::pin(async move { Ok(provider_gas_estimate) }));
 
         // Mock provider for balance check
         mock_provider
@@ -3104,7 +3118,10 @@ mod tests {
         // Mock price calculator
         mock_price_calculator
             .expect_get_transaction_price_params()
-            .returning(move |_, _| Ok(price_params.clone()));
+            .returning(move |tx, _| {
+                assert_eq!(tx.gas_limit, Some(expected_gas_with_buffer));
+                Ok(price_params.clone())
+            });
 
         // Mock transaction counter to return a nonce
         counter_service
@@ -3113,22 +3130,28 @@ mod tests {
             .returning(|_, _| Box::pin(async { Ok(42) }));
 
         // Mock signer to return a signed transaction
-        mock_signer.expect_sign_transaction().returning(|_| {
-            Box::pin(ready(Ok(
-                crate::domain::relayer::SignTransactionResponse::Evm(
-                    crate::domain::relayer::SignTransactionResponseEvm {
-                        hash: "0xhash".to_string(),
-                        signature: crate::models::EvmTransactionDataSignature {
-                            r: "r".to_string(),
-                            s: "s".to_string(),
-                            v: 1,
-                            sig: "0xsignature".to_string(),
+        mock_signer
+            .expect_sign_transaction()
+            .times(1)
+            .returning(move |tx| {
+                let data = tx.get_evm_transaction_data().unwrap();
+                assert_eq!(data.gas_limit, Some(expected_gas_with_buffer));
+                assert_eq!(data.nonce, Some(42));
+                Box::pin(ready(Ok(
+                    crate::domain::relayer::SignTransactionResponse::Evm(
+                        crate::domain::relayer::SignTransactionResponseEvm {
+                            hash: "0xhash".to_string(),
+                            signature: crate::models::EvmTransactionDataSignature {
+                                r: "r".to_string(),
+                                s: "s".to_string(),
+                                v: 1,
+                                sig: "0xsignature".to_string(),
+                            },
+                            raw: vec![1, 2, 3],
                         },
-                        raw: vec![1, 2, 3],
-                    },
-                ),
-            )))
-        });
+                    ),
+                )))
+            });
 
         // Mock job producer to capture the submission job
         mock_job_producer
@@ -3143,7 +3166,7 @@ mod tests {
         // Note: prepare_transaction calls partial_update twice:
         // 1. Presign update (saves nonce before signing)
         // 2. Postsign update (saves signed data and marks as Sent)
-        let expected_gas_limit = EXPECTED_GAS_WITH_BUFFER;
+        let expected_gas_limit = expected_gas_with_buffer;
 
         let test_tx_clone = test_tx.clone();
         mock_transaction
@@ -3195,7 +3218,7 @@ mod tests {
 
         // Verify the final transaction has the estimated gas limit
         if let NetworkTransactionData::Evm(evm_data) = prepared_tx.network_data {
-            assert_eq!(evm_data.gas_limit, Some(EXPECTED_GAS_WITH_BUFFER));
+            assert_eq!(evm_data.gas_limit, Some(expected_gas_with_buffer));
         } else {
             panic!("Expected EVM network data");
         }
