@@ -8,11 +8,16 @@ local owner = redis.call('HGET', KEYS[5], 'owner')
 if owner then
     local ended = redis.call('ZSCORE', KEYS[6], owner)
         or redis.call('ZSCORE', KEYS[7], owner)
+    -- System cleanup copies terminal ACK evidence before aging out Apalis sets.
+    -- Only evidence for this exact owner can release a persistent reservation.
+    if not ended and redis.call('HGET', KEYS[5], 'ack_owner') == owner then
+        ended = redis.call('HGET', KEYS[5], 'ack_at')
+    end
     if not ended then return {0, owner, 'queued_or_running'} end
     -- Recover a lost completion update from Apalis's durable acknowledgement.
     -- Count its unknown outcome conservatively as a failed attempt.
     local failures = redis.call('HINCRBY', KEYS[5], 'failures', 1)
-    redis.call('HDEL', KEYS[5], 'owner')
+    redis.call('HDEL', KEYS[5], 'owner', 'ack_owner', 'ack_at')
     redis.call('HSET', KEYS[5], 'next_allowed',
         tonumber(ended) + math.min(30 * 2 ^ (failures - 1), 900))
     if failures >= 8 then
@@ -48,6 +53,7 @@ else
     redis.call('DEL', KEYS[3])
     redis.call('LPUSH', KEYS[3], 1)
 end
+redis.call('HDEL', KEYS[5], 'ack_owner', 'ack_at')
 redis.call('HSET', KEYS[5], 'owner', ARGV[1])
 redis.call('PERSIST', KEYS[5])
 return {1, ARGV[1], 'enqueued'}

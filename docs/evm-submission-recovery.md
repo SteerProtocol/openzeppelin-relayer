@@ -64,3 +64,19 @@ Targeted regressions (no live RPC or transaction submissions):
 cargo test --release --test polygon_gas_estimation --locked --features redis-tls-native
 cargo test --release --lib test_prepare_transaction_ --locked --features redis-tls-native
 ```
+
+## Acknowledgment evidence and persistent owners
+
+If the completion-control update fails, a queued owner does not expire. Before
+system cleanup removes a terminal Apalis `:done` or `:dead` entry and its job
+payload, it atomically copies the acknowledgment's task ID and original timestamp
+into the matching control's `ack_owner` and `ack_at` fields. Enqueue can recover
+from this evidence even after an outage outlasts the ten-minute queue retention.
+The unknown outcome consumes one unsuccessful attempt, preserving the existing
+cooldown and eight-cycle budget. A retryable `:failed` entry is not proof of completion.
+
+Evidence only releases its exact owner; stale completion cannot release a newer
+reservation. It is cleared on recovery or matching completion. Live/crashed work
+retains its reservation without a timeout. Cleanup still reclaims ordinary queue
+payloads and results in bounded batches. This protects future cleanup; it does
+not reconstruct acknowledgments already erased before the fix.

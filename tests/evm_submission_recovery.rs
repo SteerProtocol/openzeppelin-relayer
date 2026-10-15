@@ -350,3 +350,26 @@ async fn redis_tls_setup_returns_an_error_instead_of_panicking_on_a_closed_peer(
     );
     peer.await.unwrap();
 }
+
+#[test]
+fn submission_cleanup_can_read_the_actual_apalis_owner_payload() {
+    use apalis::prelude::Request;
+    use apalis_redis::RedisContext;
+    use openzeppelin_relayer::jobs::{Job, JobType, TransactionSend};
+    let mut request: Request<_, RedisContext> = Request::new(Job::new(
+        JobType::TransactionSend,
+        TransactionSend::submit("tx", "keeper"),
+    ));
+    let owner = request.parts.task_id.to_string();
+    request
+        .args
+        .data
+        .metadata
+        .get_or_insert_with(Default::default)
+        .insert("redis_submission_owner".into(), owner.clone());
+    let payload = serde_json::to_value(request).unwrap();
+    let job = &payload["args"]["data"];
+    assert_eq!(job["relayer_id"], "keeper");
+    assert_eq!(job["transaction_id"], "tx");
+    assert_eq!(job["metadata"]["redis_submission_owner"], owner);
+}

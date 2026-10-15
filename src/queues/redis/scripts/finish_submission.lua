@@ -7,7 +7,7 @@ local failures = 0
 if ARGV[2] ~= 'progress' then
     failures = tonumber(redis.call('HGET', KEYS[1], 'failures') or '0') + 1
 end
-redis.call('HDEL', KEYS[1], 'owner')
+redis.call('HDEL', KEYS[1], 'owner', 'ack_owner', 'ack_at')
 redis.call('HSET', KEYS[1], 'failures', failures,
     'next_allowed', now + math.min(30 * 2 ^ math.max(failures - 1, 0), 900))
 if ARGV[2] == 'permanent' or failures >= 8 then

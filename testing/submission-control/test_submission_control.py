@@ -41,6 +41,7 @@ class SubmissionControlTests(unittest.TestCase):
         self.ns = "test:" + uuid.uuid4().hex
         self.keys = [self.ns + suffix for suffix in
                      [":data", ":active", ":signal", ":scheduled", ":control", ":done", ":dead"]]
+        self.keys[4] = self.keys[0] + ":submission-control:keeper:tx"
 
     @classmethod
     def command(cls, *args):
@@ -74,7 +75,10 @@ class SubmissionControlTests(unittest.TestCase):
     def enqueue(self, task="task-1", scheduled=""):
         script = (ROOT / "src/queues/redis/scripts/enqueue_submission.lua").read_text()
         return self.command("EVAL", script, len(self.keys), *self.keys,
-                            task, json.dumps({"args": {"message_id": task}}), scheduled)
+                            task, json.dumps({"args": {"message_id": task, "data": {
+                                "relayer_id": "keeper", "transaction_id": "tx",
+                                "metadata": {"redis_submission_owner": task},
+                            }}}), scheduled)
 
     def test_repeated_status_checks_enqueue_only_one_job(self):
         self.enqueue("first")
@@ -161,6 +165,125 @@ class SubmissionControlTests(unittest.TestCase):
         self.command("ZADD", self.keys[6], 1, "first")
         self.assertEqual(self.enqueue("after-ack")[0], 1)
         self.assertEqual(self.command("HGET", self.keys[4], "failures"), "1")
+
+    def cleanup(self, ack_key, cutoff, batch_size=100):
+        script = (ROOT / "src/jobs/handlers/scripts/cleanup_job_metadata.lua").read_text()
+        return self.command("EVAL", script, 5, ack_key, self.keys[0],
+                            self.keys[0] + "::result", self.keys[5], self.keys[6],
+                            cutoff, batch_size)
+
+    def test_lost_completion_recovers_after_ack_cleanup_and_producer_outage(self):
+        for suffix in (":done", ":dead"):
+            with self.subTest(ack_set=suffix):
+                self.setUp()
+                # Use each actual terminal acknowledgment set in turn.
+                ack_key = self.ns + suffix
+                self.enqueue("first")
+                self.command("LPOP", self.keys[1])
+                now = int(self.command("TIME")[0])
+                ended_at = now - 7200
+                self.command("ZADD", ack_key, ended_at, "first")
+                self.command("HSET", self.keys[0] + "::result", "first", "result")
+                # No producer runs until two hours after the ACK, past retention.
+                self.assertEqual(self.cleanup(ack_key, now - 600), 1)
+                self.assertIsNone(self.command("ZSCORE", ack_key, "first"))
+                self.assertIsNone(self.command("HGET", self.keys[0], "first"))
+                self.assertIsNone(self.command("HGET", self.keys[0] + "::result", "first"))
+                self.assertEqual(self.command("TTL", self.keys[4]), -1)
+                self.assertEqual(self.command("HGET", self.keys[4], "ack_owner"), "first")
+                self.assertEqual(self.command("HGET", self.keys[4], "ack_at"), str(ended_at))
+                self.assertEqual(self.enqueue("recovered")[0], 1)
+                self.assertIsNone(self.command("HGET", self.keys[4], "ack_owner"))
+                self.assertEqual(self.command("HGET", self.keys[4], "failures"), "1")
+                self.assertEqual(self.enqueue("duplicate")[0], 0)
+                self.assertEqual(self.command("LRANGE", self.keys[1], 0, -1), ["recovered"])
+
+    def test_cleanup_ack_for_old_delivery_does_not_release_new_owner(self):
+        self.enqueue("first")
+        self.finish("first", "progress")
+        self.command("HSET", self.keys[4], "next_allowed", 0)
+        self.enqueue("second")
+        self.command("ZADD", self.keys[5], 1, "first")
+        self.cleanup(self.keys[5], 2)
+        self.assertIsNone(self.command("HGET", self.keys[4], "ack_owner"))
+        self.assertEqual(self.command("HGET", self.keys[4], "owner"), "second")
+        self.assertEqual(self.enqueue("third")[0], 0)
+
+    def test_retryable_failed_set_is_not_completion_evidence(self):
+        self.enqueue("first")
+        failed_key = self.ns + ":failed"
+        self.command("ZADD", failed_key, 1, "first")
+        self.cleanup(failed_key, 2)
+        self.assertIsNotNone(self.command("HGET", self.keys[0], "first"))
+        self.assertIsNone(self.command("HGET", self.keys[4], "ack_owner"))
+        self.assertEqual(self.enqueue("second")[0], 0)
+
+    def test_failed_set_cleanup_preserves_later_terminal_ack(self):
+        self.enqueue("first")
+        failed_key = self.ns + ":failed"
+        self.command("ZADD", failed_key, 1, "first")
+        self.command("ZADD", self.keys[6], 10, "first")
+        self.cleanup(failed_key, 2)
+        self.assertEqual(self.command("HGET", self.keys[4], "ack_at"), "10")
+        self.assertIsNone(self.command("HGET", self.keys[0], "first"))
+        self.cleanup(self.keys[6], 11)
+        self.assertIsNone(self.command("ZSCORE", self.keys[6], "first"))
+        self.assertEqual(self.enqueue("recovered")[0], 1)
+
+    def test_late_completion_preserves_new_owners_copied_ack(self):
+        self.enqueue("first")
+        self.finish("first", "progress")
+        self.command("HSET", self.keys[4], "next_allowed", 0)
+        self.enqueue("second")
+        self.command("ZADD", self.keys[5], 1, "second")
+        self.cleanup(self.keys[5], 2)
+        self.assertEqual(self.finish("first", "progress"), 0)
+        self.assertEqual(self.command("HGET", self.keys[4], "ack_owner"), "second")
+        self.assertEqual(self.enqueue("third")[0], 1)
+
+    def test_matching_completion_clears_copied_ack_and_resets_budget(self):
+        self.enqueue("first")
+        self.command("ZADD", self.keys[5], 1, "first")
+        self.cleanup(self.keys[5], 2)
+        self.assertEqual(self.finish("first", "progress"), 1)
+        for field in ("owner", "ack_owner", "ack_at"):
+            self.assertIsNone(self.command("HGET", self.keys[4], field))
+        self.assertEqual(self.command("HGET", self.keys[4], "failures"), "0")
+
+    def test_copied_ack_exhausts_retry_budget_once(self):
+        self.enqueue("first")
+        self.command("HSET", self.keys[4], "failures", 7)
+        self.command("ZADD", self.keys[6], 1, "first")
+        self.cleanup(self.keys[6], 2)
+        for owner in ("second", "third"):
+            self.assertEqual(self.enqueue(owner), [-1, "", "retry_budget_exhausted"])
+        self.assertEqual(self.command("HGET", self.keys[4], "failures"), "8")
+        self.assertEqual(self.command("TTL", self.keys[4]), -1)
+
+    def test_cleanup_preflight_preserves_ack_on_wrong_result_type(self):
+        self.enqueue("first")
+        self.command("ZADD", self.keys[5], 1, "first")
+        result_key = self.keys[0] + "::result"
+        self.command("SET", result_key, "wrong-type")
+        with self.assertRaises(RuntimeError):
+            self.cleanup(self.keys[5], 2)
+        self.assertEqual(self.command("ZSCORE", self.keys[5], "first"), "1")
+        self.assertIsNotNone(self.command("HGET", self.keys[0], "first"))
+        self.assertIsNone(self.command("HGET", self.keys[4], "ack_owner"))
+
+    def test_cleanup_remains_bounded_and_retains_recent_jobs(self):
+        self.enqueue("first")
+        for task in ("first", "old-2", "old-3", "old-4", "old-5"):
+            self.command("ZADD", self.keys[5], 1, task)
+            if task != "first":
+                self.command("HSET", self.keys[0], task, "{}")
+        self.command("ZADD", self.keys[5], 10, "recent")
+        self.command("HSET", self.keys[0], "recent", "recent-data")
+        self.assertEqual([self.cleanup(self.keys[5], 2, batch_size=2) for _ in range(4)], [2, 2, 1, 0])
+        self.assertEqual(self.command("ZRANGE", self.keys[5], 0, -1), ["recent"])
+        self.assertEqual(self.command("HGET", self.keys[0], "recent"), "recent-data")
+        self.assertEqual(self.command("HGET", self.keys[4], "ack_owner"), "first")
+        self.assertEqual(self.enqueue("recovered")[0], 1)
 
     def test_success_resets_failure_budget(self):
         self.enqueue("first")
