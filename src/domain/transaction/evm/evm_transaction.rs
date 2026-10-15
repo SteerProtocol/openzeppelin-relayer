@@ -13,13 +13,16 @@ use tracing::{debug, error, info, warn};
 use crate::{
     constants::{
         matches_known_transaction, ALREADY_SUBMITTED_PATTERNS, DEFAULT_EVM_GAS_LIMIT_ESTIMATION,
-        DEFAULT_EVM_STATUS_CHECK_RETRY_DELAY_SECONDS, GAS_LIMIT_BUFFER_MULTIPLIER,
+        DEFAULT_EVM_STATUS_CHECK_RETRY_DELAY_SECONDS, KNOWN_ARBITRUM_CHAIN_IDS,
         MAX_NONCE_TOO_HIGH_RETRIES, NONCE_TOO_HIGH_PATTERNS,
     },
     domain::{
         evm::is_noop,
         transaction::{
-            evm::{ensure_status, ensure_status_one_of, PriceCalculator, PriceCalculatorTrait},
+            evm::{
+                buffered_gas_estimate, ensure_status, ensure_status_one_of, PriceCalculator,
+                PriceCalculatorTrait,
+            },
             Transaction,
         },
         EvmTransactionValidationError, EvmTransactionValidator,
@@ -392,7 +395,8 @@ where
             relayer_id = %tx.relayer_id,
             "enqueueing submit transaction job"
         );
-        let job = TransactionSend::submit(tx.id.clone(), tx.relayer_id.clone());
+        let job = TransactionSend::submit(tx.id.clone(), tx.relayer_id.clone())
+            .with_network_type(NetworkType::Evm);
 
         self.job_producer()
             .produce_submit_transaction_job(job, None)
@@ -412,7 +416,8 @@ where
             relayer_id = %tx.relayer_id,
             "enqueueing resubmit transaction job"
         );
-        let job = TransactionSend::resubmit(tx.id.clone(), tx.relayer_id.clone());
+        let job = TransactionSend::resubmit(tx.id.clone(), tx.relayer_id.clone())
+            .with_network_type(NetworkType::Evm);
 
         self.job_producer()
             .produce_submit_transaction_job(job, None)
@@ -432,7 +437,8 @@ where
             relayer_id = %tx.relayer_id,
             "enqueueing resend transaction job"
         );
-        let job = TransactionSend::resend(tx.id.clone(), tx.relayer_id.clone());
+        let job = TransactionSend::resend(tx.id.clone(), tx.relayer_id.clone())
+            .with_network_type(NetworkType::Evm);
 
         self.job_producer()
             .produce_submit_transaction_job(job, None)
@@ -622,7 +628,12 @@ where
             TransactionError::UnexpectedError(format!("Failed to estimate gas: {e}"))
         })?;
 
-        Ok(estimated_gas * GAS_LIMIT_BUFFER_MULTIPLIER / 100)
+        let gas_limit = buffered_gas_estimate(evm_data.chain_id, estimated_gas)?;
+        info!(
+            chain_id = evm_data.chain_id,
+            estimated_gas, gas_limit, "selected automatic gas limit"
+        );
+        Ok(gas_limit)
     }
 }
 
@@ -868,7 +879,8 @@ where
         // after preparing the transaction, we need to submit it to the job queue
         self.job_producer
             .produce_submit_transaction_job(
-                TransactionSend::submit(updated_tx.id.clone(), updated_tx.relayer_id.clone()),
+                TransactionSend::submit(updated_tx.id.clone(), updated_tx.relayer_id.clone())
+                    .with_network_type(NetworkType::Evm),
                 None,
             )
             .await?;
@@ -937,11 +949,10 @@ where
                 let error_kind = Self::classify_submission_error(&e);
 
                 match (&tx.status, &error_kind) {
-                    // AlreadyKnown / ReplacementUnderpriced (any status):
+                    // AlreadyKnown (any status):
                     // The node recognizes the exact same transaction bytes (same hash)
                     // in its mempool — this confirms it's our tx. Safe to treat as submitted.
-                    (_, SubmissionErrorKind::AlreadyKnown)
-                    | (_, SubmissionErrorKind::ReplacementUnderpriced) => {
+                    (_, SubmissionErrorKind::AlreadyKnown) => {
                         warn!(
                             tx_id = %tx.id,
                             error = %e,
@@ -1110,7 +1121,10 @@ where
             return Ok(tx);
         }
 
-        let evm_data = tx.network_data.get_evm_transaction_data()?;
+        let mut evm_data = tx.network_data.get_evm_transaction_data()?;
+        if is_noop(&evm_data) && KNOWN_ARBITRUM_CHAIN_IDS.contains(&evm_data.chain_id) {
+            super::utils::refresh_arbitrum_noop_gas(&mut evm_data, &self.provider).await?;
+        }
 
         // Calculate bumped gas price
         // For noop transactions, force_bump=true to skip gas price cap and ensure bump succeeds
@@ -1154,6 +1168,38 @@ where
             TransactionError::InvalidType("Raw transaction data is missing".to_string())
         })?;
 
+        // Persist the signed candidate before any broadcast. A timeout or crash
+        // must leave both old and replacement hashes available for reconciliation.
+        let mut candidate_hashes = tx.hashes.clone();
+        if let Some(hash) = tx.network_data.get_evm_transaction_data()?.hash {
+            if !candidate_hashes.contains(&hash) {
+                candidate_hashes.push(hash);
+            }
+        }
+        if let Some(hash) = final_evm_data.hash.clone() {
+            if !candidate_hashes.contains(&hash) {
+                candidate_hashes.push(hash);
+            }
+        }
+        let tx = self
+            .transaction_repository
+            .partial_update(
+                tx.id.clone(),
+                TransactionUpdateRequest {
+                    network_data: Some(NetworkTransactionData::Evm(final_evm_data.clone())),
+                    hashes: Some(candidate_hashes),
+                    priced_at: Some(Utc::now().to_rfc3339()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if !matches!(
+            tx.status,
+            TransactionStatus::Sent | TransactionStatus::Submitted
+        ) {
+            return Ok(tx);
+        }
+
         // Send resubmitted transaction to blockchain - this is the critical operation
         let was_already_submitted = match self.provider.send_raw_transaction(raw_tx).await {
             Ok(_) => {
@@ -1164,9 +1210,8 @@ where
                 let error_kind = Self::classify_submission_error(&e);
 
                 match &error_kind {
-                    // AlreadyKnown / ReplacementUnderpriced: existing behavior — keep original hash
-                    SubmissionErrorKind::AlreadyKnown
-                    | SubmissionErrorKind::ReplacementUnderpriced => {
+                    // AlreadyKnown: the candidate is known to the node.
+                    SubmissionErrorKind::AlreadyKnown => {
                         warn!(
                             tx_id = %tx.id,
                             error = %e,
@@ -1228,7 +1273,9 @@ where
             // Transaction resubmitted successfully - update with new hash and pricing
             let mut hashes = tx.hashes.clone();
             if let Some(hash) = final_evm_data.hash.clone() {
-                hashes.push(hash);
+                if !hashes.contains(&hash) {
+                    hashes.push(hash);
+                }
             }
 
             TransactionUpdateRequest {
@@ -1318,8 +1365,18 @@ where
             .partial_update(tx.id.clone(), update)
             .await?;
 
-        // Submit the updated transaction to the network using the resubmit job
-        self.send_transaction_resubmit_job(&updated_tx).await?;
+        // Explicit cancellation needs the resubmit path to sign the new NOOP,
+        // but must bypass the automatic retry budget/cooldown for the old action.
+        self.job_producer()
+            .produce_submit_transaction_job(
+                TransactionSend::cancellation_resubmit(
+                    updated_tx.id.clone(),
+                    updated_tx.relayer_id.clone(),
+                )
+                .with_network_type(NetworkType::Evm),
+                None,
+            )
+            .await?;
 
         // Send notification for the updated transaction
         if let Err(e) = self.send_transaction_update_notification(&updated_tx).await {
@@ -3004,6 +3061,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_transaction_uses_gas_estimation_and_stores_result() {
+        assert_prepared_gas_limit(1, 45000, 49500).await;
+        assert_prepared_gas_limit(137, 74592, 111888).await;
+    }
+
+    async fn assert_prepared_gas_limit(chain_id: u64, estimate: u64, expected: u64) {
         let mut mock_transaction = MockTransactionRepository::new();
         let mock_relayer = MockRelayerRepository::new();
         let mut mock_provider = MockEvmProviderTrait::new();
@@ -3023,19 +3085,20 @@ mod tests {
         // Create test transaction WITHOUT gas_limit (so estimation will be triggered)
         let mut test_tx = create_test_transaction();
         if let NetworkTransactionData::Evm(ref mut evm_data) = test_tx.network_data {
+            evm_data.chain_id = chain_id;
             evm_data.gas_limit = None; // This should trigger gas estimation
             evm_data.nonce = None; // This will be set by the counter service
         }
 
         // Expected estimated gas from provider
-        const PROVIDER_GAS_ESTIMATE: u64 = 45000;
-        const EXPECTED_GAS_WITH_BUFFER: u64 = 49500; // 45000 * 110 / 100
+        let provider_gas_estimate = estimate;
+        let expected_gas_with_buffer = expected;
 
         // Mock provider to return specific gas estimate
         mock_provider
             .expect_estimate_gas()
             .times(1)
-            .returning(move |_| Box::pin(async move { Ok(PROVIDER_GAS_ESTIMATE) }));
+            .returning(move |_| Box::pin(async move { Ok(provider_gas_estimate) }));
 
         // Mock provider for balance check
         mock_provider
@@ -3055,7 +3118,10 @@ mod tests {
         // Mock price calculator
         mock_price_calculator
             .expect_get_transaction_price_params()
-            .returning(move |_, _| Ok(price_params.clone()));
+            .returning(move |tx, _| {
+                assert_eq!(tx.gas_limit, Some(expected_gas_with_buffer));
+                Ok(price_params.clone())
+            });
 
         // Mock transaction counter to return a nonce
         counter_service
@@ -3064,22 +3130,28 @@ mod tests {
             .returning(|_, _| Box::pin(async { Ok(42) }));
 
         // Mock signer to return a signed transaction
-        mock_signer.expect_sign_transaction().returning(|_| {
-            Box::pin(ready(Ok(
-                crate::domain::relayer::SignTransactionResponse::Evm(
-                    crate::domain::relayer::SignTransactionResponseEvm {
-                        hash: "0xhash".to_string(),
-                        signature: crate::models::EvmTransactionDataSignature {
-                            r: "r".to_string(),
-                            s: "s".to_string(),
-                            v: 1,
-                            sig: "0xsignature".to_string(),
+        mock_signer
+            .expect_sign_transaction()
+            .times(1)
+            .returning(move |tx| {
+                let data = tx.get_evm_transaction_data().unwrap();
+                assert_eq!(data.gas_limit, Some(expected_gas_with_buffer));
+                assert_eq!(data.nonce, Some(42));
+                Box::pin(ready(Ok(
+                    crate::domain::relayer::SignTransactionResponse::Evm(
+                        crate::domain::relayer::SignTransactionResponseEvm {
+                            hash: "0xhash".to_string(),
+                            signature: crate::models::EvmTransactionDataSignature {
+                                r: "r".to_string(),
+                                s: "s".to_string(),
+                                v: 1,
+                                sig: "0xsignature".to_string(),
+                            },
+                            raw: vec![1, 2, 3],
                         },
-                        raw: vec![1, 2, 3],
-                    },
-                ),
-            )))
-        });
+                    ),
+                )))
+            });
 
         // Mock job producer to capture the submission job
         mock_job_producer
@@ -3094,7 +3166,7 @@ mod tests {
         // Note: prepare_transaction calls partial_update twice:
         // 1. Presign update (saves nonce before signing)
         // 2. Postsign update (saves signed data and marks as Sent)
-        let expected_gas_limit = EXPECTED_GAS_WITH_BUFFER;
+        let expected_gas_limit = expected_gas_with_buffer;
 
         let test_tx_clone = test_tx.clone();
         mock_transaction
@@ -3146,7 +3218,7 @@ mod tests {
 
         // Verify the final transaction has the estimated gas limit
         if let NetworkTransactionData::Evm(evm_data) = prepared_tx.network_data {
-            assert_eq!(evm_data.gas_limit, Some(EXPECTED_GAS_WITH_BUFFER));
+            assert_eq!(evm_data.gas_limit, Some(expected_gas_with_buffer));
         } else {
             panic!("Expected EVM network data");
         }
@@ -3622,7 +3694,7 @@ mod tests {
     /// Test resubmit_transaction when transaction is already submitted
     /// Should NOT update hash, only status
     #[tokio::test]
-    async fn test_resubmit_transaction_already_submitted_preserves_hash() {
+    async fn test_resubmit_transaction_already_known_retains_both_hashes() {
         let mut mock_transaction = MockTransactionRepository::new();
         let mock_relayer = MockRelayerRepository::new();
         let mut mock_provider = MockEvmProviderTrait::new();
@@ -3674,7 +3746,7 @@ mod tests {
                 Box::pin(ready(Ok(
                     crate::domain::relayer::SignTransactionResponse::Evm(
                         crate::domain::relayer::SignTransactionResponseEvm {
-                            hash: "0xnew_hash_that_should_not_be_saved".to_string(),
+                            hash: "0xknown_candidate_hash".to_string(),
                             signature: crate::models::EvmTransactionDataSignature {
                                 r: "r".to_string(),
                                 s: "s".to_string(),
@@ -3700,7 +3772,26 @@ mod tests {
             });
 
         // Verify that partial_update is called with NO network_data (preserving original hash)
-        let test_tx_clone = test_tx.clone();
+        // Signed replacement is durable before the provider is called.
+        let candidate_snapshot = test_tx.clone();
+        mock_transaction
+            .expect_partial_update()
+            .withf(|_, update| {
+                update.status.is_none() && update.network_data.is_some() && update.hashes.is_some()
+            })
+            .times(1)
+            .returning(move |_, update| {
+                let mut saved = candidate_snapshot.clone();
+                saved.apply_partial_update(update);
+                Ok(saved)
+            });
+
+        let mut test_tx_clone = test_tx.clone();
+        if let NetworkTransactionData::Evm(ref mut data) = test_tx_clone.network_data {
+            data.hash = Some("0xknown_candidate_hash".into());
+            data.raw = Some(vec![4, 5, 6]);
+        }
+        test_tx_clone.hashes.push("0xknown_candidate_hash".into());
         mock_transaction
             .expect_partial_update()
             .times(1)
@@ -3735,7 +3826,8 @@ mod tests {
 
         // Verify hash was NOT changed
         if let NetworkTransactionData::Evm(evm_data) = &updated_tx.network_data {
-            assert_eq!(evm_data.hash, Some(original_hash));
+            assert_eq!(evm_data.hash, Some("0xknown_candidate_hash".into()));
+            assert!(updated_tx.hashes.contains(&original_hash));
         } else {
             panic!("Expected EVM network data");
         }
@@ -4059,6 +4151,20 @@ mod tests {
             .returning(|_| Box::pin(async { Ok("0xnew_hash".to_string()) }));
 
         // Should update to Submitted status with new hash
+        // Signed replacement is durable before the provider is called.
+        let candidate_snapshot = test_tx.clone();
+        mock_transaction
+            .expect_partial_update()
+            .withf(|_, update| {
+                update.status.is_none() && update.network_data.is_some() && update.hashes.is_some()
+            })
+            .times(1)
+            .returning(move |_, update| {
+                let mut saved = candidate_snapshot.clone();
+                saved.apply_partial_update(update);
+                Ok(saved)
+            });
+
         let test_tx_clone = test_tx.clone();
         mock_transaction
             .expect_partial_update()
@@ -4476,6 +4582,20 @@ mod tests {
             .returning(|_, _| Box::pin(ready(Ok(()))));
 
         // Should update status without changing hash (was_already_submitted = true)
+        // Signed replacement is durable before the provider is called.
+        let candidate_snapshot = test_tx.clone();
+        mock_transaction
+            .expect_partial_update()
+            .withf(|_, update| {
+                update.status.is_none() && update.network_data.is_some() && update.hashes.is_some()
+            })
+            .times(1)
+            .returning(move |_, update| {
+                let mut saved = candidate_snapshot.clone();
+                saved.apply_partial_update(update);
+                Ok(saved)
+            });
+
         let test_tx_clone = test_tx.clone();
         mock_transaction
             .expect_partial_update()
@@ -4754,6 +4874,20 @@ mod tests {
             });
 
         // Should persist incremented counter (nonce_too_high_retries = 1) in metadata
+        // Signed replacement is durable before the provider is called.
+        let candidate_snapshot = test_tx.clone();
+        mock_transaction
+            .expect_partial_update()
+            .withf(|_, update| {
+                update.status.is_none() && update.network_data.is_some() && update.hashes.is_some()
+            })
+            .times(1)
+            .returning(move |_, update| {
+                let mut saved = candidate_snapshot.clone();
+                saved.apply_partial_update(update);
+                Ok(saved)
+            });
+
         let test_tx_clone = test_tx.clone();
         mock_transaction
             .expect_partial_update()

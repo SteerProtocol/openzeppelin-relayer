@@ -423,10 +423,26 @@ pub async fn send_transaction(
     request: serde_json::Value,
     state: web::ThinData<DefaultAppState>,
 ) -> Result<HttpResponse, ApiError> {
-    let relayer_repo_model = get_relayer_by_id(relayer_id, &state).await?;
+    let started = std::time::Instant::now();
+    let lookup = get_relayer_by_id(relayer_id.clone(), &state).await;
+    crate::metrics::observe_processing_time(
+        &relayer_id,
+        "unknown",
+        "api_relayer_lookup",
+        started.elapsed().as_secs_f64(),
+    );
+    let relayer_repo_model = lookup?;
     relayer_repo_model.validate_active_state()?;
 
-    let relayer = get_network_relayer(relayer_repo_model.id.clone(), &state).await?;
+    let started = std::time::Instant::now();
+    let construction = get_network_relayer(relayer_repo_model.id.clone(), &state).await;
+    crate::metrics::observe_processing_time(
+        &relayer_id,
+        &relayer_repo_model.network_type.to_string(),
+        "api_relayer_construction",
+        started.elapsed().as_secs_f64(),
+    );
+    let relayer = construction?;
 
     let tx_request: NetworkTransactionRequest =
         NetworkTransactionRequest::from_json(&relayer_repo_model.network_type, request.clone())?;

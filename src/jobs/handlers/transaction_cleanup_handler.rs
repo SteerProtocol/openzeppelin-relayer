@@ -577,7 +577,10 @@ fn extract_nonce_from_network_data(network_data: &NetworkTransactionData) -> Opt
 ///
 /// # Returns
 /// * `bool` - True if the transaction should be deleted, false otherwise
-fn should_delete_transaction(transaction: &TransactionRepoModel, now: DateTime<Utc>) -> bool {
+pub fn should_delete_transaction(transaction: &TransactionRepoModel, now: DateTime<Utc>) -> bool {
+    if transaction.requires_nonce_reconciliation() {
+        return false;
+    }
     transaction
         .delete_at
         .as_ref()

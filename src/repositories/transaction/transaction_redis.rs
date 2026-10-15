@@ -1943,7 +1943,7 @@ impl TransactionRepository for RedisTransactionRepository {
         nonce: u64,
     ) -> Result<Option<TransactionRepoModel>, RepositoryError> {
         let mut conn = self
-            .get_connection(self.connections.reader(), "find_by_nonce")
+            .get_connection(self.connections.primary(), "find_by_nonce")
             .await?;
         let nonce_key = self.relayer_nonce_key(relayer_id, nonce);
 
@@ -1953,17 +1953,19 @@ impl TransactionRepository for RedisTransactionRepository {
             .await
             .map_err(|e| self.map_redis_error(e, "find_by_nonce"))?;
 
+        // Nonce ownership is a safety decision. Read both index and record
+        // from the primary; replica lag must never make a reserved slot empty.
         match tx_id {
             Some(tx_id) => {
-                match self.get_by_id(tx_id.clone()).await {
-                    Ok(tx) => Ok(Some(tx)),
-                    Err(RepositoryError::NotFound(_)) => {
-                        // Transaction was deleted but index wasn't cleaned up
-                        warn!(relayer_id = %relayer_id, nonce = %nonce, "stale nonce index found for relayer");
-                        Ok(None)
-                    }
-                    Err(e) => Err(e),
-                }
+                let key = self.tx_key(relayer_id, &tx_id);
+                let raw: Option<String> = conn
+                    .get(key)
+                    .await
+                    .map_err(|e| self.map_redis_error(e, "find_by_nonce:transaction"))?;
+                raw.map(|json| {
+                    self.deserialize_entity::<TransactionRepoModel>(&json, &tx_id, "transaction")
+                })
+                .transpose()
             }
             None => Ok(None),
         }
@@ -2120,7 +2122,19 @@ impl TransactionRepository for RedisTransactionRepository {
             -- A stale worker must not resurrect a tx that another worker
             -- already moved to a terminal state.
             local final_states = {confirmed=true, failed=true, expired=true, canceled=true}
-            if final_states[tx["status"]] and patch["status"] then
+            local failure_prefix = 'Automatic submission failed: '
+            local reason = tx["status_reason"]
+            local preserved_failure = tx["status"] == 'failed'
+                and type(reason) == 'string'
+                and string.sub(reason, 1, #failure_prefix) == failure_prefix
+            local patch_reason = patch["status_reason"]
+            local automation_failure = type(patch_reason) == 'string'
+                and string.sub(patch_reason, 1, #failure_prefix) == failure_prefix
+            if preserved_failure
+                or (final_states[tx["status"]] and patch["status"])
+                or (tx["status"] == 'mined' and automation_failure)
+                or ((tx["status"] == 'mined' or final_states[tx["status"]])
+                    and patch["network_data"] and patch["hashes"]) then
                 return {current, current}
             end
 

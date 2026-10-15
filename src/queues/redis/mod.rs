@@ -8,6 +8,7 @@ pub mod backend;
 pub mod queue;
 pub mod refreshing_connection;
 mod status_retry_policy;
+pub(crate) mod submission_control;
 pub mod worker;
 
 pub use worker as redis_worker;

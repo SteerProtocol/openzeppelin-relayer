@@ -237,23 +237,38 @@ where
         let transaction =
             TransactionRepoModel::try_from((&network_transaction, &self.relayer, &network_model))?;
 
-        self.transaction_repository
+        let started = std::time::Instant::now();
+        let persistence = self
+            .transaction_repository
             .create(transaction.clone())
-            .await
-            .map_err(|e| RepositoryError::TransactionFailure(e.to_string()))?;
+            .await;
+        crate::metrics::observe_processing_time(
+            &self.relayer.id,
+            "evm",
+            "api_transaction_persistence",
+            started.elapsed().as_secs_f64(),
+        );
+        persistence.map_err(|e| RepositoryError::TransactionFailure(e.to_string()))?;
 
         let initial_delay_seconds = self.network.status_check_initial_delay_seconds();
 
         // Status check FIRST - this is our safety net for monitoring.
         // If this fails, mark transaction as failed and don't proceed.
         // This ensures we never have an unmonitored transaction.
-        if let Err(e) = super::schedule_initial_status_check(
+        let started = std::time::Instant::now();
+        let status_enqueue = super::schedule_initial_status_check(
             self.job_producer.as_ref(),
             &transaction,
             &self.network,
         )
-        .await
-        {
+        .await;
+        crate::metrics::observe_processing_time(
+            &self.relayer.id,
+            "evm",
+            "api_status_queue_insert",
+            started.elapsed().as_secs_f64(),
+        );
+        if let Err(e) = status_enqueue {
             // Status queue failed - mark transaction as failed to prevent orphaned tx
             error!(
                 relayer_id = %self.relayer.id,
@@ -292,12 +307,21 @@ where
 
         // Now safe to push transaction request.
         // Even if this fails, status check will monitor and detect the stuck transaction.
-        self.job_producer
+        let started = std::time::Instant::now();
+        let prepare_enqueue = self
+            .job_producer
             .produce_transaction_request_job(
                 TransactionRequest::new(transaction.id.clone(), transaction.relayer_id.clone()),
                 None,
             )
-            .await?;
+            .await;
+        crate::metrics::observe_processing_time(
+            &self.relayer.id,
+            "evm",
+            "api_prepare_queue_insert",
+            started.elapsed().as_secs_f64(),
+        );
+        prepare_enqueue?;
 
         Ok(transaction)
     }

@@ -218,9 +218,15 @@ where
         relayer: &RelayerRepoModel,
         force_bump: bool,
     ) -> Result<PriceParams, TransactionError> {
-        // Check if network lacks mempool (e.g., Arbitrum) - skip bump and use current prices
-        if self.gas_price_service.network().lacks_mempool()
-            || self.gas_price_service.network().is_arbitrum()
+        // Speed-only requests have no prior fee to bump. Once fees are resolved,
+        // refresh from the market on every network, including Arbitrum. Reusing
+        // get_transaction_price_params with a persisted fee returns that stale fee.
+        let has_resolved_fee = tx_data.gas_price.is_some()
+            || tx_data.max_fee_per_gas.is_some()
+            || tx_data.max_priority_fee_per_gas.is_some();
+        if !has_resolved_fee
+            && (self.gas_price_service.network().lacks_mempool()
+                || self.gas_price_service.network().is_arbitrum())
         {
             let mut price_params = self.get_transaction_price_params(tx_data, relayer).await?;
 
@@ -347,8 +353,9 @@ where
         let capped_max_fee = Self::cap_gas_price(final_max_fee, gas_price_cap);
 
         // Check if the capped values still meet the minimum bump requirements
-        let is_min_bumped =
-            capped_priority >= min_bump_max_priority && capped_max_fee >= min_bump_max_fee;
+        let is_min_bumped = capped_priority >= min_bump_max_priority
+            && capped_max_fee >= min_bump_max_fee
+            && capped_max_fee >= base_fee_wei.saturating_add(capped_priority);
 
         // Step 6: Return the final bumped gas parameters.
         Ok(PriceParams {
@@ -391,7 +398,8 @@ where
         let capped_gas_price = Self::cap_gas_price(bumped_gas_price, gas_price_cap);
 
         // Check if the capped value still meets the minimum bump requirement
-        let is_min_bumped = capped_gas_price >= min_bump_gas_price;
+        let is_min_bumped = capped_gas_price >= min_bump_gas_price
+            && capped_gas_price >= network_gas_prices.base_fee_per_gas;
 
         Ok(PriceParams {
             gas_price: Some(capped_gas_price),
@@ -1874,6 +1882,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn arbitrum_repricing_refreshes_persisted_legacy_fee() {
+        let mut service = MockEvmGasPriceServiceTrait::new();
+        service
+            .expect_network()
+            .return_const(create_mock_no_mempool_network("arbitrum"));
+        service
+            .expect_get_prices_from_json_rpc()
+            .times(1)
+            .returning(|| {
+                Box::pin(async {
+                    Ok(GasPrices {
+                        legacy_prices: SpeedPrices {
+                            safe_low: 25_000_000,
+                            average: 25_000_000,
+                            fast: 25_000_000,
+                            fastest: 25_000_000,
+                        },
+                        max_priority_fee_per_gas: SpeedPrices::default(),
+                        base_fee_per_gas: 25_000_000,
+                    })
+                })
+            });
+        let calculator = PriceCalculator::new(service, None);
+        let tx = EvmTransactionData {
+            gas_price: Some(20_006_000),
+            gas_limit: Some(77_438),
+            speed: Some(Speed::Average),
+            ..Default::default()
+        };
+        let repriced = calculator
+            .calculate_bumped_gas_price(&tx, &create_mock_relayer(), false)
+            .await
+            .unwrap();
+        assert!(repriced.gas_price.unwrap() >= 25_000_000);
+        assert!(repriced.gas_price.unwrap() > tx.gas_price.unwrap());
+    }
+
+    #[tokio::test]
     async fn test_calculate_bumped_gas_price_no_mempool_network_eip1559() {
         let mut mock_service = MockEvmGasPriceServiceTrait::new();
 
@@ -1931,6 +1977,7 @@ mod tests {
 
         // Create a speed-based transaction that would normally be bumped
         let tx_data = EvmTransactionData {
+            gas_price: None,
             speed: Some(Speed::Fast),
             gas_limit: Some(21000),
             value: U256::from(1_000_000_000_000_000_000u128), // 1 ETH
@@ -1995,6 +2042,7 @@ mod tests {
 
         // Create a speed-based transaction that would normally be bumped
         let tx_data = EvmTransactionData {
+            gas_price: None,
             speed: Some(Speed::Fast),
             gas_limit: Some(21000),
             value: U256::from(1_000_000_000_000_000_000u128), // 1 ETH
@@ -2026,7 +2074,12 @@ mod tests {
         let mut mock_service_regular = MockEvmGasPriceServiceTrait::new();
 
         let mock_prices = GasPrices {
-            legacy_prices: SpeedPrices::default(),
+            legacy_prices: SpeedPrices {
+                safe_low: 60_000_000_000,
+                average: 60_000_000_000,
+                fast: 60_000_000_000,
+                fastest: 60_000_000_000,
+            },
             max_priority_fee_per_gas: SpeedPrices {
                 safe_low: 1_000_000_000,
                 average: 2_000_000_000,

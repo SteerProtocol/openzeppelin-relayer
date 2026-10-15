@@ -191,6 +191,14 @@ impl QueueBackend for RedisBackend {
         job: Job<TransactionSend>,
         scheduled_on: Option<i64>,
     ) -> Result<String, QueueBackendError> {
+        if super::submission_control::applies(&job.data) {
+            return super::submission_control::enqueue(
+                &self.queue.transaction_submission_queue,
+                job,
+                scheduled_on,
+            )
+            .await;
+        }
         let mut storage = self.queue.transaction_submission_queue.clone();
         let job_id = job.message_id.clone();
 

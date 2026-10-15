@@ -273,8 +273,8 @@ async fn cleanup_queue(pool: &Arc<Pool>, namespace: &str, cutoff_timestamp: i64)
 
 /// Cleans up job IDs from a sorted set and their associated data/result hashes.
 ///
-/// Uses ZRANGEBYSCORE to find old job IDs, then removes them from the
-/// sorted set and both the data and result hashes in a pipeline for efficiency.
+/// Atomically copies terminal acknowledgment evidence into any matching submission
+/// control, then removes the old IDs and payload/result hash entries in bounded batches.
 ///
 /// # Arguments
 /// * `pool` - Redis connection pool
@@ -294,51 +294,22 @@ async fn cleanup_sorted_set_and_hashes(
 ) -> Result<usize> {
     let mut total_cleaned = 0usize;
     let mut conn = pool.get().await?;
+    let namespace = data_key
+        .strip_suffix(":data")
+        .ok_or_else(|| eyre::eyre!("Invalid queue data key"))?;
 
     loop {
-        // Get batch of old job IDs from sorted set
-        // ZRANGEBYSCORE key -inf cutoff LIMIT 0 batch_size
-        let job_ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
-            .arg(sorted_set_key)
-            .arg("-inf")
-            .arg(cutoff_timestamp)
-            .arg("LIMIT")
-            .arg(0)
-            .arg(CLEANUP_BATCH_SIZE)
-            .query_async(&mut conn)
-            .await?;
-
-        if job_ids.is_empty() {
-            break;
-        }
-
-        let batch_size = job_ids.len();
-
-        // Use pipeline to remove from sorted set and both hashes atomically
-        let mut pipe = redis::pipe();
-
-        // ZREM sorted_set_key job_id1 job_id2 ...
-        pipe.cmd("ZREM").arg(sorted_set_key);
-        for job_id in &job_ids {
-            pipe.arg(job_id);
-        }
-        pipe.ignore();
-
-        // HDEL data_key job_id1 job_id2 ...
-        pipe.cmd("HDEL").arg(data_key);
-        for job_id in &job_ids {
-            pipe.arg(job_id);
-        }
-        pipe.ignore();
-
-        // HDEL result_key job_id1 job_id2 ...
-        pipe.cmd("HDEL").arg(result_key);
-        for job_id in &job_ids {
-            pipe.arg(job_id);
-        }
-        pipe.ignore();
-
-        pipe.query_async::<()>(&mut conn).await?;
+        let batch_size: usize =
+            redis::Script::new(include_str!("scripts/cleanup_job_metadata.lua"))
+                .key(sorted_set_key)
+                .key(data_key)
+                .key(result_key)
+                .key(format!("{namespace}:done"))
+                .key(format!("{namespace}:dead"))
+                .arg(cutoff_timestamp)
+                .arg(CLEANUP_BATCH_SIZE)
+                .invoke_async(&mut conn)
+                .await?;
 
         total_cleaned += batch_size;
 

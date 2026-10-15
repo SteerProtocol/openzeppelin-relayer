@@ -147,7 +147,34 @@ pub struct TransactionRepoModel {
     pub metadata: Option<TransactionMetadata>,
 }
 
+/// Stable marker shared with the atomic Redis patch guard. This is an off-chain
+/// automation failure, not proof of an on-chain revert or unused nonce.
+pub const AUTOMATIC_SUBMISSION_FAILURE_PREFIX: &str = "Automatic submission failed: ";
+
 impl TransactionRepoModel {
+    /// Keep the intent, signed bytes and nonce reservation until an operator
+    /// reconciles an automatic submission failure with the chain.
+    pub fn requires_nonce_reconciliation(&self) -> bool {
+        self.status == TransactionStatus::Failed
+            && self
+                .status_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(AUTOMATIC_SUBMISSION_FAILURE_PREFIX))
+            && self
+                .network_data
+                .get_evm_transaction_data()
+                .is_ok_and(|data| data.nonce.is_some())
+    }
+
+    pub fn automatic_submission_failure(reason: &str) -> TransactionUpdateRequest {
+        TransactionUpdateRequest {
+            status: Some(TransactionStatus::Failed),
+            status_reason: Some(format!(
+                "{AUTOMATIC_SUBMISSION_FAILURE_PREFIX}{reason}; nonce requires reconciliation"
+            )),
+            ..Default::default()
+        }
+    }
     /// Validates the transaction repository model
     ///
     /// # Returns
@@ -182,7 +209,26 @@ impl TransactionRepoModel {
     /// # Arguments
     /// * `update` - The partial update request containing the fields to update
     pub fn apply_partial_update(&mut self, update: TransactionUpdateRequest) {
-        // Apply partial updates
+        // Match the Redis atomic guard: stale workers cannot mutate preserved
+        // intent or overwrite a mined transaction with an automation failure.
+        if (self.status == TransactionStatus::Failed
+            && self
+                .status_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with(AUTOMATIC_SUBMISSION_FAILURE_PREFIX)))
+            || (FINAL_TRANSACTION_STATUSES.contains(&self.status) && update.status.is_some())
+            || ((self.status == TransactionStatus::Mined
+                || FINAL_TRANSACTION_STATUSES.contains(&self.status))
+                && update.network_data.is_some()
+                && update.hashes.is_some())
+            || (self.status == TransactionStatus::Mined
+                && update
+                    .status_reason
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with(AUTOMATIC_SUBMISSION_FAILURE_PREFIX)))
+        {
+            return;
+        }
         if let Some(status) = update.status {
             self.status = status;
             self.update_delete_at_if_final_status();
