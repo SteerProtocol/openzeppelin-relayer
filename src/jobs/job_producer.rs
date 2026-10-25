@@ -631,6 +631,7 @@ mod tests {
             "test_event".to_string(),
             WebhookPayload::Transaction(TransactionResponse::Evm(Box::new(
                 EvmTransactionResponse {
+                    fee_ceiling_wei: None,
                     id: "tx123".to_string(),
                     hash: Some("0x123".to_string()),
                     status: TransactionStatus::Confirmed,
@@ -941,6 +942,7 @@ mod tests {
             "test_scheduled_event".to_string(),
             WebhookPayload::Transaction(TransactionResponse::Evm(Box::new(
                 EvmTransactionResponse {
+                    fee_ceiling_wei: None,
                     id: "tx-notify-scheduled".to_string(),
                     hash: Some("0xabc123".to_string()),
                     status: TransactionStatus::Confirmed,

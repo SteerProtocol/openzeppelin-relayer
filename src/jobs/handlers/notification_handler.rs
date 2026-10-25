@@ -103,6 +103,7 @@ mod tests {
         // Create a basic notification webhook payload
         let payload = WebhookPayload::Transaction(TransactionResponse::Evm(Box::new(
             EvmTransactionResponse {
+                fee_ceiling_wei: None,
                 id: "tx123".to_string(),
                 hash: Some("0x123".to_string()),
                 status: TransactionStatus::Confirmed,
@@ -145,6 +146,7 @@ mod tests {
 
         let transaction_payload = WebhookPayload::Transaction(TransactionResponse::Evm(Box::new(
             EvmTransactionResponse {
+                fee_ceiling_wei: None,
                 id: "tx123".to_string(),
                 hash: Some("0x123".to_string()),
                 status: TransactionStatus::Confirmed,

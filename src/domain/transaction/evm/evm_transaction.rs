@@ -743,6 +743,11 @@ where
             "gas price"
         );
 
+        evm_data
+            .clone()
+            .with_price_params(price_params.clone())
+            .validate_fee_ceiling()?;
+
         // Validate the relayer has sufficient balance before consuming nonce and signing
         if let Err(balance_error) = self
             .ensure_sufficient_balance(price_params.total_cost)
@@ -822,6 +827,8 @@ where
             .network_data
             .get_evm_transaction_data()?
             .with_price_params(price_params.clone());
+
+        updated_evm_data.validate_fee_ceiling()?;
 
         // Now sign the transaction - if this fails, we still have the tx with nonce saved
         let sig_result = self
@@ -1122,12 +1129,18 @@ where
             return Ok(tx);
         }
 
+        // Create new transaction data with bumped gas price
+        let updated_evm_data = evm_data.with_price_params(bumped_price_params.clone());
+
+        // A network-specific finalizer may change the calculated fee. Keep the original
+        // pending if that fee exceeds the stored action ceiling.
+        if let Err(error) = updated_evm_data.validate_fee_ceiling() {
+            warn!(tx_id = %tx.id, %error, "Replacement blocked by transaction fee ceiling");
+            return Ok(tx);
+        }
         // Validate the relayer has sufficient balance
         self.ensure_sufficient_balance(bumped_price_params.total_cost)
             .await?;
-
-        // Create new transaction data with bumped gas price
-        let updated_evm_data = evm_data.with_price_params(bumped_price_params.clone());
 
         // Sign the transaction
         let sig_result = self
@@ -1399,6 +1412,7 @@ where
 
         // Apply the calculated price parameters to the updated EVM data
         let evm_data_with_price_params = updated_evm_data.with_price_params(price_params.clone());
+        evm_data_with_price_params.validate_fee_ceiling()?;
 
         // Validate the relayer has sufficient balance
         self.ensure_sufficient_balance(price_params.total_cost)
@@ -1580,6 +1594,7 @@ mod tests {
                 value: U256::from(1000000000000000000u64), // 1 ETH
                 data: Some("0xData".to_string()),
                 gas_limit: Some(21000),
+                fee_ceiling_wei: None,
                 gas_price: Some(20000000000), // 20 Gwei
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
@@ -2566,6 +2581,7 @@ mod tests {
                 value: U256::from(2000000000000000000u64), // 2 ETH
                 data: Some("0xNewData".to_string()),
                 gas_limit: Some(25000),
+                fee_ceiling_wei: None,
                 gas_price: None, // Use speed-based pricing
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
@@ -2636,6 +2652,7 @@ mod tests {
                 value: U256::from(1000000000000000000u64),
                 data: Some("0xData".to_string()),
                 gas_limit: Some(21000),
+                fee_ceiling_wei: None,
                 gas_price: Some(30000000000),
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
@@ -2678,6 +2695,7 @@ mod tests {
             value: U256::from(1000000000000000000u128),
             data: Some("0x".to_string()),
             gas_limit: None,
+            fee_ceiling_wei: None,
             gas_price: Some(20_000_000_000),
             nonce: Some(1),
             chain_id: 1,
@@ -2740,6 +2758,7 @@ mod tests {
             value: U256::from(1000000000000000000u128),
             data: Some("0x".to_string()),
             gas_limit: None,
+            fee_ceiling_wei: None,
             gas_price: Some(20_000_000_000),
             nonce: Some(1),
             chain_id: 1,
@@ -2800,6 +2819,7 @@ mod tests {
             value: U256::from(1000000000000000000u128),
             data: Some("0x".to_string()),
             gas_limit: None,
+            fee_ceiling_wei: None,
             gas_price: Some(20_000_000_000),
             nonce: Some(1),
             chain_id: 1,
@@ -2861,6 +2881,7 @@ mod tests {
             value: U256::from(1000000000000000000u128),
             data: Some("0x".to_string()),
             gas_limit: None,
+            fee_ceiling_wei: None,
             gas_price: Some(20_000_000_000),
             nonce: Some(1),
             chain_id: 1,
@@ -3380,6 +3401,146 @@ mod tests {
 
         let result = evm_transaction.submit_transaction(test_tx).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fee_ceiling_resubmit_does_not_sign_or_modify_original() {
+        let mut price_calculator = MockPriceCalculator::new();
+        price_calculator
+            .expect_calculate_bumped_gas_price()
+            .times(1)
+            .returning(|_, _, _| {
+                Ok(PriceParams {
+                    gas_price: Some(25_000_000_000),
+                    max_fee_per_gas: None,
+                    max_priority_fee_per_gas: None,
+                    is_min_bumped: Some(true),
+                    extra_fee: None,
+                    total_cost: U256::ZERO,
+                })
+            });
+        let mut tx = create_test_transaction();
+        tx.status = TransactionStatus::Submitted;
+        let mut data = tx.network_data.get_evm_transaction_data().unwrap();
+        data.fee_ceiling_wei = Some(20_000_000_000);
+        tx.network_data = NetworkTransactionData::Evm(data);
+        let transaction = EvmRelayerTransaction {
+            relayer: create_test_relayer(),
+            provider: MockEvmProviderTrait::new(),
+            relayer_repository: Arc::new(MockRelayerRepository::new()),
+            network_repository: Arc::new(MockNetworkRepository::new()),
+            transaction_repository: Arc::new(MockTransactionRepository::new()),
+            transaction_counter_service: Arc::new(MockTransactionCounterTrait::new()),
+            job_producer: Arc::new(MockJobProducerTrait::new()),
+            price_calculator,
+            signer: MockSigner::new(),
+        };
+        // Unconfigured mocks fail if signing, broadcasting, balance reads or writes occur.
+        let result = transaction.resubmit_transaction(tx.clone()).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            serde_json::to_value(tx).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fee_ceiling_initial_prepare_does_not_consume_nonce_or_sign() {
+        let mut price_calculator = MockPriceCalculator::new();
+        price_calculator
+            .expect_get_transaction_price_params()
+            .times(1)
+            .returning(|_, _| {
+                Ok(PriceParams {
+                    gas_price: Some(25_000_000_000),
+                    max_fee_per_gas: None,
+                    max_priority_fee_per_gas: None,
+                    is_min_bumped: Some(true),
+                    extra_fee: None,
+                    total_cost: U256::ZERO,
+                })
+            });
+        let mut tx = create_test_transaction();
+        tx.status = TransactionStatus::Pending;
+        let mut data = tx.network_data.get_evm_transaction_data().unwrap();
+        data.fee_ceiling_wei = Some(20_000_000_000);
+        tx.network_data = NetworkTransactionData::Evm(data);
+        let mut provider = MockEvmProviderTrait::new();
+        provider
+            .expect_get_block_by_number()
+            .times(1)
+            .returning(|| {
+                Box::pin(async {
+                    Err(crate::services::provider::ProviderError::Other(
+                        "fixture".into(),
+                    ))
+                })
+            });
+        let transaction = EvmRelayerTransaction {
+            relayer: create_test_relayer(),
+            provider,
+            relayer_repository: Arc::new(MockRelayerRepository::new()),
+            network_repository: Arc::new(MockNetworkRepository::new()),
+            transaction_repository: Arc::new(MockTransactionRepository::new()),
+            transaction_counter_service: Arc::new(MockTransactionCounterTrait::new()),
+            job_producer: Arc::new(MockJobProducerTrait::new()),
+            price_calculator,
+            signer: MockSigner::new(),
+        };
+        // Unconfigured mocks fail if signing, broadcasting, balance reads or writes occur.
+        assert!(matches!(
+            transaction.prepare_transaction(tx).await,
+            Err(TransactionError::ValidationError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fee_ceiling_manual_replacement_cannot_bypass_stored_cap() {
+        let mut price_calculator = MockPriceCalculator::new();
+        price_calculator
+            .expect_get_transaction_price_params()
+            .times(1)
+            .returning(|_, _| {
+                Ok(PriceParams {
+                    gas_price: Some(25_000_000_000),
+                    max_fee_per_gas: None,
+                    max_priority_fee_per_gas: None,
+                    is_min_bumped: Some(true),
+                    extra_fee: None,
+                    total_cost: U256::ZERO,
+                })
+            });
+        let mut tx = create_test_transaction();
+        tx.status = TransactionStatus::Submitted;
+        let mut data = tx.network_data.get_evm_transaction_data().unwrap();
+        data.fee_ceiling_wei = Some(20_000_000_000);
+        tx.network_data = NetworkTransactionData::Evm(data);
+        let mut network = MockNetworkRepository::new();
+        network
+            .expect_get_by_chain_id()
+            .times(1)
+            .returning(|_, _| Ok(Some(create_test_network_repo_model("mainnet", None))));
+        let request = NetworkTransactionRequest::Evm(EvmTransactionRequest {
+            fee_ceiling_wei: Some(30_000_000_000),
+            gas_limit: Some(21_000),
+            speed: Some(Speed::Fast),
+            ..Default::default()
+        });
+        let transaction = EvmRelayerTransaction {
+            relayer: create_test_relayer(),
+            provider: MockEvmProviderTrait::new(),
+            relayer_repository: Arc::new(MockRelayerRepository::new()),
+            network_repository: Arc::new(network),
+            transaction_repository: Arc::new(MockTransactionRepository::new()),
+            transaction_counter_service: Arc::new(MockTransactionCounterTrait::new()),
+            job_producer: Arc::new(MockJobProducerTrait::new()),
+            price_calculator,
+            signer: MockSigner::new(),
+        };
+        // Unconfigured mocks fail if signing, broadcasting, balance reads or writes occur.
+        assert!(matches!(
+            transaction.replace_transaction(tx, request).await,
+            Err(TransactionError::ValidationError(_))
+        ));
     }
 
     /// Test resubmit_transaction when transaction is already submitted

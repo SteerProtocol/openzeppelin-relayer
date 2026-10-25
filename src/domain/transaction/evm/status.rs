@@ -1742,6 +1742,7 @@ mod tests {
                 value: U256::from(0),
                 data: Some("0xData".to_string()),
                 gas_limit: Some(21000),
+                fee_ceiling_wei: None,
                 gas_price: Some(20000000000),
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,

@@ -138,6 +138,7 @@ mod tests {
 
     fn mock_transaction_response() -> TransactionResponse {
         TransactionResponse::Evm(Box::new(EvmTransactionResponse {
+            fee_ceiling_wei: None,
             id: "tx_123".to_string(),
             hash: Some("0x123...".to_string()),
             status: TransactionStatus::Pending,

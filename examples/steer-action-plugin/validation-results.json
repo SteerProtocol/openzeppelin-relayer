@@ -1,0 +1,26 @@
+{
+  "transactionHash": "0xb50977e00631abc7abb39157cf52b8d8f0b634868458931c311c9bfdfd876289",
+  "transactionIndex": "0x2",
+  "receiptStatus": "0x0",
+  "chainId": "42161",
+  "snapshot": {
+    "number": "0x1e6a0a32",
+    "hash": "0x55a3d08671057785812ed253cb05f83aa4a507a985f6cb42ad31caaef6ea8406",
+    "gasLimit": "0x4000000000000",
+    "timestamp": "0x6abcab8b"
+  },
+  "proxyCodeHash": "0x1e71c4a5b01c61a4b1a4afa98257a085e472bfc63a362efa77be9a23e714cdc9",
+  "implementation": "0x2822ee30383eabcba817ab4a7a592f4a194e14b5",
+  "implementationCodeHash": "0x19518d57e84d67f1841a410375dc1295d8c7af5468a3ef13170b03d4b9a3e4ca",
+  "guardRuntimeHash": "0x713de9c987ddab345bff58463b84fba1e0e41708bc2dfe5096fabd419e9b8929",
+  "originalGas": 458181,
+  "originalOutcome": "RPC_ERROR_OR_REVERT",
+  "ordinaryEstimate": 480448,
+  "ordinaryEstimateOutcome": "PENDING",
+  "guardedEstimate": 510677,
+  "guardedEstimateDirectOutcome": "COMPLETED",
+  "selectedGas": 561745,
+  "selectedOutcome": "COMPLETED",
+  "marginBps": 1000,
+  "caveat": "Pinned historical simulation, not exact transaction-index replay, future success, or production integration."
+}

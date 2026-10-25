@@ -14,6 +14,14 @@ pub struct EvmTransactionRequest {
     pub value: U256,
     #[schema(nullable = false)]
     pub data: Option<String>,
+    /// Maximum fee per gas for this transaction and all action replacements, in wei.
+    #[serde(
+        default,
+        serialize_with = "crate::utils::serialize_optional_u128",
+        deserialize_with = "crate::utils::deserialize_optional_u128"
+    )]
+    #[schema(value_type = Option<String>, nullable = false)]
+    pub fee_ceiling_wei: Option<u128>,
     pub gas_limit: Option<u64>,
     #[schema(nullable = false)]
     pub gas_price: Option<u128>,
@@ -123,6 +131,22 @@ pub fn validate_price_params(
     request: &EvmTransactionRequest,
     relayer: &RelayerRepoModel,
 ) -> Result<(), ApiError> {
+    if let Some(cap) = request.fee_ceiling_wei {
+        if cap == 0
+            || [
+                request.gas_price,
+                request.max_fee_per_gas,
+                request.max_priority_fee_per_gas,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|fee| fee > cap)
+        {
+            return Err(ApiError::BadRequest(
+                "Transaction fee exceeds fee_ceiling_wei or ceiling is zero".into(),
+            ));
+        }
+    }
     let is_eip1559 =
         request.max_fee_per_gas.is_some() || request.max_priority_fee_per_gas.is_some();
     let is_legacy = request.gas_price.is_some();
@@ -197,6 +221,7 @@ mod tests {
             value: U256::from(0),
             data: Some("0x".to_string()),
             gas_limit: Some(21000),
+            fee_ceiling_wei: None,
             gas_price: Some(0),
             speed: None,
             max_fee_per_gas: None,

@@ -25,6 +25,13 @@ pub enum TransactionResponse {
 
 #[derive(Debug, Serialize, Clone, PartialEq, Deserialize, ToSchema)]
 pub struct EvmTransactionResponse {
+    #[serde(
+        default,
+        serialize_with = "serialize_optional_u128",
+        deserialize_with = "deserialize_optional_u128"
+    )]
+    #[schema(nullable = false, value_type = String)]
+    pub fee_ceiling_wei: Option<u128>,
     pub id: String,
     #[schema(nullable = false)]
     pub hash: Option<String>,
@@ -130,6 +137,7 @@ impl From<TransactionRepoModel> for TransactionResponse {
         match model.network_data {
             NetworkTransactionData::Evm(evm_data) => {
                 TransactionResponse::Evm(Box::new(EvmTransactionResponse {
+                    fee_ceiling_wei: evm_data.fee_ceiling_wei,
                     id: model.id,
                     hash: evm_data.hash,
                     status: model.status,
@@ -234,6 +242,7 @@ mod tests {
             hashes: vec![],
             network_data: NetworkTransactionData::Evm(EvmTransactionData {
                 hash: Some("0xabc123".to_string()),
+                fee_ceiling_wei: None,
                 gas_price: Some(20_000_000_000),
                 gas_limit: Some(21000),
                 nonce: Some(5),

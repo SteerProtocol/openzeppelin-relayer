@@ -872,6 +872,7 @@ mod tests {
         let tx_data = EvmTransactionData {
             from: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
             to: Some("0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string()),
+            fee_ceiling_wei: None,
             gas_price: Some(1000000000),
             value: Uint::<256, 4>::from(1000000000),
             data: Some("0x".to_string()),
@@ -990,6 +991,7 @@ mod tests {
         let tx_data = EvmTransactionData {
             from: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
             to: Some("0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string()),
+            fee_ceiling_wei: None,
             gas_price: Some(1000000000),
             value: Uint::<256, 4>::from(1000000000),
             data: Some("0x".to_string()),
@@ -1030,6 +1032,7 @@ mod tests {
         let tx_data = EvmTransactionData {
             from: "invalid-address".to_string(),
             to: Some("0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string()),
+            fee_ceiling_wei: None,
             gas_price: Some(1000000000),
             value: Uint::<256, 4>::from(1000000000),
             data: Some("0x".to_string()),
@@ -1053,6 +1056,7 @@ mod tests {
         let tx_data = EvmTransactionData {
             from: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
             to: None,
+            fee_ceiling_wei: None,
             gas_price: Some(1000000000),
             value: Uint::<256, 4>::from(0),
             data: Some("0x6080604052348015600f57600080fd5b".to_string()),
@@ -1078,6 +1082,7 @@ mod tests {
         let tx_data = EvmTransactionData {
             from: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
             to: Some("invalid-address".to_string()),
+            fee_ceiling_wei: None,
             gas_price: Some(1000000000),
             value: Uint::<256, 4>::from(0),
             data: Some("0x".to_string()),
