@@ -9,6 +9,8 @@ use openzeppelin_relayer::{
 
 struct Market {
     network: EvmNetwork,
+    base_fee: Option<u128>,
+    market_price: Option<u128>,
 }
 #[async_trait]
 impl EvmGasPriceServiceTrait for Market {
@@ -18,10 +20,10 @@ impl EvmGasPriceServiceTrait for Market {
     }
     async fn get_legacy_prices_from_json_rpc(&self) -> Result<SpeedPrices, TransactionError> {
         Ok(SpeedPrices {
-            safe_low: 25_000_000,
-            average: 25_000_000,
-            fast: 25_000_000,
-            fastest: 25_000_000,
+            safe_low: self.market_price.unwrap_or(25_000_000),
+            average: self.market_price.unwrap_or(25_000_000),
+            fast: self.market_price.unwrap_or(25_000_000),
+            fastest: self.market_price.unwrap_or(25_000_000),
         })
     }
     async fn get_prices_from_json_rpc(&self) -> Result<GasPrices, TransactionError> {
@@ -33,7 +35,7 @@ impl EvmGasPriceServiceTrait for Market {
                 fast: 0,
                 fastest: 0,
             },
-            base_fee_per_gas: 25_000_000,
+            base_fee_per_gas: self.base_fee.unwrap_or(25_000_000),
         })
     }
     async fn get_current_base_fee(&self) -> Result<u128, TransactionError> {
@@ -45,6 +47,8 @@ impl EvmGasPriceServiceTrait for Market {
 }
 fn market() -> Market {
     Market {
+        base_fee: None,
+        market_price: None,
         network: EvmNetwork {
             network: "arbitrum".into(),
             rpc_urls: vec![RpcConfig::new("https://example.invalid".into())],
@@ -373,3 +377,50 @@ fn submission_cleanup_can_read_the_actual_apalis_owner_payload() {
     assert_eq!(job["transaction_id"], "tx");
     assert_eq!(job["metadata"]["redis_submission_owner"], owner);
 }
+
+#[tokio::test]
+async fn retry_uses_fresh_base_fee_when_speed_quote_lags() {
+    let mut service = market();
+    service.base_fee = Some(30_000_000);
+    service.market_price = Some(20_000_000);
+    let mut tx = transaction(openzeppelin_relayer::models::TransactionStatus::Sent)
+        .network_data
+        .get_evm_transaction_data()
+        .unwrap();
+    tx.fee_ceiling_wei = Some(35_000_000);
+    let p = PriceCalculator::new(service, None)
+        .calculate_bumped_gas_price(&tx, &RelayerRepoModel::default(), false)
+        .await
+        .unwrap();
+    assert_eq!(p.gas_price, Some(30_000_000));
+    assert_eq!(p.is_min_bumped, Some(true));
+}
+
+#[tokio::test]
+async fn production_fee_ceiling_does_not_silently_authorize_an_invalid_bump() {
+    for (original, base, ceiling) in [
+        (20_014_000, 20_060_000, 20_223_565),
+        (20_032_000, 20_076_000, 20_799_759),
+    ] {
+        let mut service = market();
+        service.base_fee = Some(base);
+        service.market_price = Some(base);
+        let mut tx = transaction(openzeppelin_relayer::models::TransactionStatus::Sent)
+            .network_data
+            .get_evm_transaction_data()
+            .unwrap();
+        tx.gas_price = Some(original);
+        tx.fee_ceiling_wei = Some(ceiling);
+        let before = serde_json::to_value(&tx).unwrap();
+        let p = PriceCalculator::new(service, None)
+            .calculate_bumped_gas_price(&tx, &RelayerRepoModel::default(), false)
+            .await
+            .unwrap();
+        assert_eq!(p.is_min_bumped, Some(false));
+        assert!(p.gas_price.unwrap() <= ceiling);
+        assert_eq!(serde_json::to_value(tx).unwrap(), before);
+    }
+}
+
+#[path = "support/fee_recovery_hold.rs"]
+mod hold;

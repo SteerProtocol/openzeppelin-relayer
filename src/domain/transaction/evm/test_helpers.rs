@@ -34,9 +34,22 @@ pub mod test_utils {
     /// Returns a default `TestMocks` with zero-configuration stubs.
     /// You can override expectations in each test as needed.
     pub fn default_test_mocks() -> TestMocks {
+        // Terminal nonce failures now persist a safety hold. Legacy status
+        // tests can focus on their transaction branch; the integration suite
+        // verifies the actual durable hold and preservation of signed intent.
+        let mut relayer_repo = MockRelayerRepository::new();
+        relayer_repo
+            .expect_partial_update()
+            .withf(|_, update| update.paused == Some(true))
+            .returning(|id, _| {
+                let mut relayer = create_test_relayer();
+                relayer.id = id;
+                relayer.paused = true;
+                Ok(relayer)
+            });
         TestMocks {
             provider: MockEvmProviderTrait::new(),
-            relayer_repo: MockRelayerRepository::new(),
+            relayer_repo,
             network_repo: MockNetworkRepository::new(),
             tx_repo: MockTransactionRepository::new(),
             job_producer: MockJobProducerTrait::new(),
