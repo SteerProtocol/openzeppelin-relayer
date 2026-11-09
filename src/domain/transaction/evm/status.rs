@@ -601,6 +601,32 @@ where
             }
         };
 
+        // A failed automatic submission still owns its signed nonce. The gap
+        // filler deliberately cannot overwrite it; repeating that job cannot
+        // make progress. Put the signer on the same durable operator hold.
+        for (nonce, status) in &occupancy {
+            if status == &Some(TransactionStatus::Failed) {
+                if let Ok(Some(owner)) = self
+                    .transaction_repository()
+                    .find_by_nonce(&tx.relayer_id, *nonce)
+                    .await
+                {
+                    if owner.requires_nonce_reconciliation() {
+                        if let Err(error) = self
+                            .pause_for_nonce_reconciliation(
+                                &owner,
+                                "earlier signed nonce requires reconciliation",
+                            )
+                            .await
+                        {
+                            warn!(relayer_id = %tx.relayer_id, %error, "failed to persist nonce reconciliation hold");
+                        }
+                        return Some(true);
+                    }
+                }
+            }
+        }
+
         let gap_nonces: Vec<u64> = occupancy
             .into_iter()
             .filter(|(_, status)| !status.as_ref().is_some_and(is_active_nonce_status))
@@ -679,11 +705,17 @@ where
 
     /// Terminal automation failures preserve intent. Cancellation/replacement
     /// requires an explicit operator decision after chain reconciliation.
-    async fn fail_automatic_recovery(
+    pub(super) async fn fail_automatic_recovery(
         &self,
         tx: TransactionRepoModel,
         reason: &str,
     ) -> Result<TransactionRepoModel, TransactionError> {
+        // Stop admissions before making an allocated nonce terminal. Failure to
+        // persist the hold must remain retryable, rather than silently opening
+        // a hole that every later transaction will poll independently.
+        if tx.network_data.get_evm_transaction_data()?.nonce.is_some() {
+            self.pause_for_nonce_reconciliation(&tx, reason).await?;
+        }
         let updated = self
             .transaction_repository()
             .partial_update(
@@ -695,6 +727,27 @@ where
             warn!(tx_id = %updated.id, %error, "terminal failure notification failed");
         }
         Ok(updated)
+    }
+
+    async fn pause_for_nonce_reconciliation(
+        &self,
+        tx: &TransactionRepoModel,
+        reason: &str,
+    ) -> Result<(), TransactionError> {
+        if !self.relayer().paused {
+            self.relayer_repository()
+                .partial_update(
+                    tx.relayer_id.clone(),
+                    crate::models::UpdateRelayerRequest {
+                        paused: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            warn!(relayer_id = %tx.relayer_id, tx_id = %tx.id, reason,
+                "relayer paused: allocated nonce requires operator reconciliation");
+        }
+        Ok(())
     }
 
     /// Handles transactions in the Pending state.
@@ -952,6 +1005,12 @@ where
         );
 
         // 1. Early return if final state
+        // Also adopt failures persisted by submission workers or an older
+        // deployment. The paused flag is durable and requires explicit resume.
+        if tx.requires_nonce_reconciliation() {
+            self.pause_for_nonce_reconciliation(&tx, "automatic submission failed")
+                .await?;
+        }
         if is_final_state(&tx.status) {
             debug!(
                 tx_id = %tx.id,
@@ -959,6 +1018,13 @@ where
                 status = ?tx.status,
                 "transaction already in final state"
             );
+            return Ok(tx);
+        }
+
+        // The handler is built from the current repository relayer for each
+        // delivery. Keep jobs/nonce ownership intact, but do no RPC recovery
+        // work while an operator or the reconciliation circuit has paused it.
+        if self.relayer().paused {
             return Ok(tx);
         }
 

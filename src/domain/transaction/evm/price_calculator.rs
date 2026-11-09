@@ -282,8 +282,35 @@ where
         };
 
         // Use price params handler if available for custom network pricing and finalize
-        self.finalize_price_params(relayer, tx_data, bumped_price_params)
-            .await
+        let mut final_params = self
+            .finalize_price_params(relayer, tx_data, bumped_price_params)
+            .await?;
+        // Custom finalizers may change or cap fees. Validate the actual signed
+        // candidate, rather than retaining the pre-finalizer bump decision.
+        final_params.is_min_bumped = Some(
+            match (
+                tx_data.gas_price,
+                tx_data.max_fee_per_gas,
+                tx_data.max_priority_fee_per_gas,
+                final_params.gas_price,
+                final_params.max_fee_per_gas,
+                final_params.max_priority_fee_per_gas,
+            ) {
+                (Some(old), None, None, Some(price), None, None) => {
+                    price >= calculate_min_bump(old)
+                        && price >= network_gas_prices.base_fee_per_gas
+                        && price <= relayer_gas_price_cap
+                }
+                (_, Some(old_max), Some(old_tip), None, Some(max), Some(tip)) => {
+                    max >= calculate_min_bump(old_max)
+                        && tip >= calculate_min_bump(old_tip)
+                        && max >= network_gas_prices.base_fee_per_gas.saturating_add(tip)
+                        && max <= relayer_gas_price_cap
+                }
+                _ => false,
+            },
+        );
+        Ok(final_params)
     }
 
     /// Computes the bumped gas parameters for an EIP-1559 transaction resubmission.
@@ -388,11 +415,10 @@ where
         let current_market_price =
             Self::get_market_price_for_speed(network_gas_prices, false, speed);
 
-        let bumped_gas_price = if current_market_price >= min_bump_gas_price {
-            current_market_price
-        } else {
-            min_bump_gas_price
-        };
+        // The speed quote can lag the freshly fetched block base fee.
+        let bumped_gas_price = current_market_price
+            .max(min_bump_gas_price)
+            .max(network_gas_prices.base_fee_per_gas);
 
         // Cap
         let capped_gas_price = Self::cap_gas_price(bumped_gas_price, gas_price_cap);

@@ -161,6 +161,10 @@ where
         &self.relayer
     }
 
+    pub(super) fn relayer_repository(&self) -> &RR {
+        &self.relayer_repository
+    }
+
     /// Returns a reference to the network repository.
     pub fn network_repository(&self) -> &NR {
         &self.network_repository
@@ -663,6 +667,11 @@ where
         &self,
         tx: TransactionRepoModel,
     ) -> Result<TransactionRepoModel, TransactionError> {
+        if self.relayer().paused {
+            return Err(TransactionError::ValidationError(
+                "Relayer is paused; preparation is held".into(),
+            ));
+        }
         debug!(
             tx_id = %tx.id,
             relayer_id = %tx.relayer_id,
@@ -911,6 +920,11 @@ where
         &self,
         tx: TransactionRepoModel,
     ) -> Result<TransactionRepoModel, TransactionError> {
+        if self.relayer().paused {
+            return Err(TransactionError::ValidationError(
+                "Relayer is paused; submission is held".into(),
+            ));
+        }
         debug!(
             tx_id = %tx.id,
             relayer_id = %tx.relayer_id,
@@ -1099,6 +1113,11 @@ where
         &self,
         tx: TransactionRepoModel,
     ) -> Result<TransactionRepoModel, TransactionError> {
+        if self.relayer().paused {
+            return Err(TransactionError::ValidationError(
+                "Relayer is paused; replacement is held".into(),
+            ));
+        }
         debug!(
             tx_id = %tx.id,
             relayer_id = %tx.relayer_id,
@@ -1138,19 +1157,22 @@ where
                 tx_id = %tx.id,
                 relayer_id = %tx.relayer_id,
                 price_params = ?bumped_price_params,
-                "bumped gas price does not meet minimum requirement, skipping resubmission"
+                "replacement fee cannot meet limits; holding signer for nonce reconciliation"
             );
-            return Ok(tx);
+            return self.fail_automatic_recovery(
+                tx,
+                "Replacement fee cannot satisfy current base fee and minimum bump within fee limits",
+            ).await;
         }
 
         // Create new transaction data with bumped gas price
         let updated_evm_data = evm_data.with_price_params(bumped_price_params.clone());
 
-        // A network-specific finalizer may change the calculated fee. Keep the original
-        // pending if that fee exceeds the stored action ceiling.
+        // A network-specific finalizer may change the calculated fee. Preserve the
+        // original intent and hold nonce ownership if it exceeds the action ceiling.
         if let Err(error) = updated_evm_data.validate_fee_ceiling() {
             warn!(tx_id = %tx.id, %error, "Replacement blocked by transaction fee ceiling");
-            return Ok(tx);
+            return self.fail_automatic_recovery(tx, &error.to_string()).await;
         }
         // Validate the relayer has sufficient balance
         self.ensure_sufficient_balance(bumped_price_params.total_cost)
