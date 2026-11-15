@@ -5,6 +5,7 @@ No AWS access or third-party Python packages are used.
 """
 import importlib.util
 import json
+import re
 from pathlib import Path
 import unittest
 
@@ -17,7 +18,10 @@ Harness = queue_tests.SubmissionControlTests
 
 def script(path, method):
     source = (ROOT / path).read_text().split('async fn ' + method + '(', 1)[1]
-    return source.split('Script::new(r#"', 1)[1].split('"#)', 1)[0]
+    match = re.search(r'Script::new\(\s*r#"(.*?)"#\s*,?\s*\)', source, re.S)
+    if not match:
+        raise AssertionError('Production Lua script not found in ' + method)
+    return match.group(1)
 
 
 class ReceiptRecoveryTests(unittest.TestCase):
