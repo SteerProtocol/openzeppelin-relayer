@@ -464,6 +464,7 @@ mod tests {
 
     fn create_test_relayer() -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer".to_string(),
             name: "Test Relayer".to_string(),
             network: "ethereum".to_string(),

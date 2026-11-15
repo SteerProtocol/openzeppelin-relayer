@@ -316,6 +316,7 @@ mod tests {
 
     fn create_disabled_relayer(id: &str) -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: id.to_string(),
             name: format!("Relayer {id}"),
             network: "sepolia".to_string(),

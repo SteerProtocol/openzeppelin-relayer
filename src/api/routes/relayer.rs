@@ -367,6 +367,7 @@ mod tests {
 
         // Create test relayer
         let test_relayer = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-id".to_string(),
             name: "Test Relayer".to_string(),
             network: "ethereum".to_string(),

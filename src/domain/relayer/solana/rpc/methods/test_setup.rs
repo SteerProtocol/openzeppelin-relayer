@@ -65,6 +65,7 @@ pub fn setup_test_context() -> (
     let transaction = Transaction::new_unsigned(message);
     // Create test relayer
     let relayer = RelayerRepoModel {
+        nonce_recovery_hold: None,
         id: "id".to_string(),
         name: "Relayer".to_string(),
         network: "testnet".to_string(),
@@ -170,6 +171,7 @@ pub fn setup_test_context_relayer_fee_strategy() -> RelayerFeeStrategyTestContex
 
     // Create test relayer
     let relayer = RelayerRepoModel {
+        nonce_recovery_hold: None,
         id: "id".to_string(),
         name: "Relayer".to_string(),
         network: "testnet".to_string(),
@@ -298,6 +300,7 @@ pub fn setup_test_context_user_fee_strategy() -> UserFeeStrategyTestContext {
     let encoded_tx = EncodedSerializedTransaction::try_from(&transaction).unwrap();
 
     let relayer = RelayerRepoModel {
+        nonce_recovery_hold: None,
         id: "id".to_string(),
         name: "Relayer".to_string(),
         network: "testnet".to_string(),
@@ -424,6 +427,7 @@ pub fn setup_test_context_single_tx_user_fee_strategy() -> UserFeeStrategySingle
     let encoded_tx = EncodedSerializedTransaction::try_from(&transaction).unwrap();
 
     let relayer = RelayerRepoModel {
+        nonce_recovery_hold: None,
         id: "id".to_string(),
         name: "Relayer".to_string(),
         network: "testnet".to_string(),

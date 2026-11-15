@@ -2066,6 +2066,114 @@ impl TransactionRepository for RedisTransactionRepository {
         self.partial_update(tx_id, update).await
     }
 
+    async fn find_nonce_recovery_transactions(
+        &self,
+        relayer_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TransactionRepoModel>, RepositoryError> {
+        let mut conn = self
+            .get_connection(self.connections.primary(), "find_nonce_recovery")
+            .await?;
+        let key = format!("{}:relayer:{}:nonce_recovery", self.key_prefix, relayer_id);
+        let ids: Vec<String> = redis::cmd("ZRANGE")
+            .arg(&key)
+            .arg(0)
+            .arg(limit.clamp(1, 8) - 1)
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| self.map_redis_error(e, "find_nonce_recovery"))?;
+        drop(conn);
+        let mut owners = Vec::new();
+        for id in ids {
+            match self.get_by_id(id.clone()).await {
+                Ok(tx)
+                    if tx.relayer_id == relayer_id
+                        && tx
+                            .network_data
+                            .get_evm_transaction_data()
+                            .ok()
+                            .and_then(|data| data.nonce)
+                            .is_some() =>
+                {
+                    owners.push(tx)
+                }
+                // Missing/changed owners are not silently removed: retention or
+                // unexpected writes require an operator rather than unsafe resume.
+                _ => {
+                    return Err(RepositoryError::ConstraintViolation(
+                        "Recovery owner missing or changed".into(),
+                    ))
+                }
+            }
+        }
+        Ok(owners)
+    }
+
+    async fn reconcile_mined_auto_failure(
+        &self,
+        expected: TransactionRepoModel,
+        succeeded: bool,
+        confirmed_at: String,
+    ) -> Result<TransactionRepoModel, RepositoryError> {
+        let updated = expected.reconciled_mined_failure(succeeded, confirmed_at)?;
+        let mut conn = self
+            .get_connection(self.connections.primary(), "reconcile_mined_auto_failure")
+            .await?;
+        let (lookup_key, key_prefix, key_suffix) = self.tx_key_parts(&expected.id);
+        let result: bool = Script::new(r#"
+            local rid = redis.call('GET', KEYS[1]); if not rid or rid ~= ARGV[1] then return false end
+            local txkey = ARGV[2] .. rid .. ARGV[3]
+            local raw = redis.call('GET', txkey); if not raw then return false end
+            local function equal(a,b)
+                if type(a) ~= type(b) then return false end
+                if type(a) ~= 'table' then return a == b end
+                for k,v in pairs(a) do if not equal(v,b[k]) then return false end end
+                for k,_ in pairs(b) do if a[k] == nil then return false end end
+                return true
+            end
+            if not equal(cjson.decode(raw), cjson.decode(ARGV[4])) then return false end
+            for i=2,#KEYS do
+                local kind = redis.call('TYPE', KEYS[i]).ok
+                local want = (i == 3 or (i >= 5 and i % 2 == 0)) and 'set' or 'zset'
+                if kind ~= 'none' and kind ~= want then return redis.error_reply('Recovery index type mismatch') end
+            end
+            local recovery_kind = redis.call('TYPE', ARGV[8]).ok
+            if recovery_kind ~= 'none' and recovery_kind ~= 'zset' then return redis.error_reply('Recovery owner type mismatch') end
+            if not redis.call('ZSCORE', ARGV[8], ARGV[6]) then return false end
+            redis.call('SET', txkey, ARGV[5], 'KEEPTTL')
+            redis.call('ZREM', KEYS[2], ARGV[6]); redis.call('SREM', KEYS[3], ARGV[6])
+            redis.call('ZADD', KEYS[4], ARGV[7], ARGV[6])
+            for i=5,#KEYS,2 do
+                redis.call('ZREM', KEYS[i], ARGV[6]); redis.call('SREM', KEYS[i+1], ARGV[6])
+            end
+            redis.call('ZREM', ARGV[8], ARGV[6])
+            return true
+        "#).key(lookup_key)
+            .key(self.relayer_status_sorted_key(&expected.relayer_id, &TransactionStatus::Failed))
+            .key(self.relayer_status_key(&expected.relayer_id, &TransactionStatus::Failed))
+            .key(self.relayer_status_sorted_key(&expected.relayer_id, &updated.status))
+            .key(self.relayer_status_sorted_key(&expected.relayer_id, &TransactionStatus::Pending))
+            .key(self.relayer_status_key(&expected.relayer_id, &TransactionStatus::Pending))
+            .key(self.relayer_status_sorted_key(&expected.relayer_id, &TransactionStatus::Sent))
+            .key(self.relayer_status_key(&expected.relayer_id, &TransactionStatus::Sent))
+            .key(self.relayer_status_sorted_key(&expected.relayer_id, &TransactionStatus::Submitted))
+            .key(self.relayer_status_key(&expected.relayer_id, &TransactionStatus::Submitted))
+            .key(self.relayer_status_sorted_key(&expected.relayer_id, &TransactionStatus::Mined))
+            .key(self.relayer_status_key(&expected.relayer_id, &TransactionStatus::Mined))
+            .arg(&expected.relayer_id).arg(key_prefix).arg(key_suffix)
+            .arg(serde_json::to_string(&expected).map_err(|e| RepositoryError::InvalidData(e.to_string()))?)
+            .arg(serde_json::to_string(&updated).map_err(|e| RepositoryError::InvalidData(e.to_string()))?)
+            .arg(&expected.id).arg(self.status_sorted_score(&updated))
+            .arg(format!("{}:relayer:{}:nonce_recovery", self.key_prefix, expected.relayer_id))
+            .invoke_async(&mut *conn).await.map_err(|e| self.map_redis_error(e, "reconcile_mined_auto_failure"))?;
+        if !result {
+            return Err(RepositoryError::ConstraintViolation(
+                "Recovery snapshot changed".into(),
+            ));
+        }
+        Ok(updated)
+    }
+
     async fn partial_update(
         &self,
         tx_id: String,
@@ -2180,6 +2288,15 @@ impl TransactionRepository for RedisTransactionRepository {
             local index_meta = nil
             if patch["status"] and new_status ~= old_status then
                 index_meta = cjson.decode(ARGV[5])
+            end
+
+            if automation_failure and tx['network_data'] and tx['network_data']['data']
+                and tx['network_data']['data']['nonce'] and tx['network_data']['data']['nonce'] ~= cjson.null then
+                local recovery_key = ARGV[1] .. relayer_id .. ':nonce_recovery'
+                local kind = redis.call('TYPE', recovery_key).ok
+                if kind ~= 'none' and kind ~= 'zset' then return redis.error_reply('Recovery owner type mismatch') end
+                local meta = cjson.decode(ARGV[5])
+                redis.call('ZADD', recovery_key, 0, meta['tx_id'])
             end
 
             redis.call('SET', tx_key, updated)

@@ -54,6 +54,7 @@ mod tests {
 
     fn solana_relayer_with_swap(id: &str, cron: Option<&str>) -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: id.to_string(),
             policies: RelayerNetworkPolicy::Solana(RelayerSolanaPolicy {
                 swap_config: Some(RelayerSolanaSwapConfig {
@@ -70,6 +71,7 @@ mod tests {
 
     fn solana_relayer_no_swap(id: &str) -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: id.to_string(),
             policies: RelayerNetworkPolicy::Solana(RelayerSolanaPolicy::default()),
             ..Default::default()
@@ -78,6 +80,7 @@ mod tests {
 
     fn stellar_relayer_with_swap(id: &str, cron: Option<&str>) -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: id.to_string(),
             policies: RelayerNetworkPolicy::Stellar(RelayerStellarPolicy {
                 swap_config: Some(RelayerStellarSwapConfig {
@@ -93,6 +96,7 @@ mod tests {
 
     fn stellar_relayer_no_swap(id: &str) -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: id.to_string(),
             policies: RelayerNetworkPolicy::Stellar(RelayerStellarPolicy::default()),
             ..Default::default()
@@ -101,6 +105,7 @@ mod tests {
 
     fn evm_relayer(id: &str) -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: id.to_string(),
             ..Default::default() // default is EVM
         }

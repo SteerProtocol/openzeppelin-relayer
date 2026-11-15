@@ -62,8 +62,11 @@ limit through the normal reviewed configuration process.
    work, and explicitly unpause the signer. Verify receipts, nonce progress and
    RPC usage per confirmed transaction before expanding traffic.
 
-Pauses never automatically clear on the next healthy RPC response. Other relayers
-are independent. There are no new configuration fields, secrets or API routes.
+A healthy RPC response alone never clears a pause. New automatically owned holds
+can now clear after canonical receipt and nonce reconciliation, as described in
+[receipt-based recovery](evm-receipt-recovery.md). Manual and legacy pauses require
+operator action. Other relayers are independent. There are no new deployment
+configuration fields, secrets or API routes.
 
 ## Verification
 

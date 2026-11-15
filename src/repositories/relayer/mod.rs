@@ -53,6 +53,88 @@ pub trait RelayerRepository: Repository<RelayerRepoModel, String> + Send + Sync 
         id: String,
         update: UpdateRelayerRequest,
     ) -> Result<RelayerRepoModel, RepositoryError>;
+    /// Atomically pauses only an active signer and records automatic recovery ownership.
+    async fn hold_for_nonce_recovery(
+        &self,
+        id: String,
+        token: String,
+    ) -> Result<RelayerRepoModel, RepositoryError> {
+        let Some((pool, prefix)) = self.connection_info() else {
+            return self
+                .partial_update(
+                    id,
+                    UpdateRelayerRequest {
+                        paused: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await;
+        };
+        let mut conn = pool
+            .get()
+            .await
+            .map_err(|e| RepositoryError::InvalidData(e.to_string()))?;
+        let raw: Option<String> = redis::Script::new(r#"
+            local raw = redis.call('GET', KEYS[1]); if not raw then return false end
+            local r = cjson.decode(raw)
+            local txraw = redis.call('GET', KEYS[3])
+            if not txraw then return redis.error_reply('Recovery transaction missing') end
+            local tx = cjson.decode(txraw)
+            local finals = {confirmed=true,failed=true,expired=true,canceled=true,mined=true}
+            local prefix = 'Automatic submission failed: '
+            local reason = tx.status_reason
+            local auto_failed = tx.status == 'failed' and type(reason) == 'string' and string.sub(reason,1,#prefix) == prefix
+            if finals[tx.status] and not auto_failed then return raw end
+            local kind = redis.call('TYPE', KEYS[2]).ok
+            if kind ~= 'none' and kind ~= 'zset' then return redis.error_reply('Recovery owner type mismatch') end
+            redis.call('ZADD', KEYS[2], 0, ARGV[1])
+            if r.paused then return raw end
+            r.paused = true; r.nonce_recovery_hold = ARGV[1]
+            local out = cjson.encode(r)
+            for k in string.gmatch(raw, '"([^"]+)"%s*:%s*%[%s*%]') do
+                out = string.gsub(out, '"'..k..'"%s*:%s*{}', '"'..k..'":[]', 1)
+            end
+            redis.call('SET', KEYS[1], out); return out
+        "#).key(format!("{prefix}:relayer:{id}")).key(format!("{prefix}:relayer:{id}:nonce_recovery")).key(format!("{prefix}:relayer:{id}:tx:{token}")).arg(token).invoke_async(&mut *conn).await
+            .map_err(|e| RepositoryError::InvalidData(e.to_string()))?;
+        serde_json::from_str(&raw.ok_or_else(|| RepositoryError::NotFound(id))?)
+            .map_err(|e| RepositoryError::InvalidData(e.to_string()))
+    }
+
+    /// Compare-and-set: a manual pause PATCH invalidates this token, including PATCH(true).
+    async fn resume_nonce_recovery(
+        &self,
+        id: String,
+        token: String,
+        expected_counter: u64,
+    ) -> Result<bool, RepositoryError> {
+        let Some((pool, prefix)) = self.connection_info() else {
+            return Err(RepositoryError::InvalidData(
+                "Atomic recovery resume unavailable".into(),
+            ));
+        };
+        let mut conn = pool
+            .get()
+            .await
+            .map_err(|e| RepositoryError::InvalidData(e.to_string()))?;
+        let resumed: bool = redis::Script::new(r#"
+            local raw = redis.call('GET', KEYS[1]); if not raw then return false end
+            local r = cjson.decode(raw)
+            if not r.paused or r.nonce_recovery_hold ~= ARGV[1] then return false end
+            if redis.call('ZCARD', KEYS[2]) ~= 0 then return false end
+            local counter = redis.call('GET', ARGV[3] .. ':transaction_counter:' .. r.id .. ':' .. r.address)
+            if counter ~= ARGV[2] then return false end
+            r.paused = false; r.nonce_recovery_hold = cjson.null
+            local out = cjson.encode(r)
+            for k in string.gmatch(raw, '"([^"]+)"%s*:%s*%[%s*%]') do
+                out = string.gsub(out, '"'..k..'"%s*:%s*{}', '"'..k..'":[]', 1)
+            end
+            redis.call('SET', KEYS[1], out); return true
+        "#).key(format!("{prefix}:relayer:{id}")).key(format!("{prefix}:relayer:{id}:nonce_recovery")).arg(token).arg(expected_counter.to_string()).arg(prefix).invoke_async(&mut *conn).await
+            .map_err(|e| RepositoryError::InvalidData(e.to_string()))?;
+        Ok(resumed)
+    }
+
     async fn enable_relayer(&self, relayer_id: String)
         -> Result<RelayerRepoModel, RepositoryError>;
     async fn disable_relayer(
@@ -236,6 +318,33 @@ impl Repository<RelayerRepoModel, String> for RelayerRepositoryStorage {
 
 #[async_trait]
 impl RelayerRepository for RelayerRepositoryStorage {
+    async fn hold_for_nonce_recovery(
+        &self,
+        id: String,
+        token: String,
+    ) -> Result<RelayerRepoModel, RepositoryError> {
+        match self {
+            Self::InMemory(repo) => repo.hold_for_nonce_recovery(id, token).await,
+            Self::Redis(repo) => repo.hold_for_nonce_recovery(id, token).await,
+        }
+    }
+    async fn resume_nonce_recovery(
+        &self,
+        id: String,
+        token: String,
+        expected_counter: u64,
+    ) -> Result<bool, RepositoryError> {
+        match self {
+            Self::InMemory(repo) => {
+                repo.resume_nonce_recovery(id, token, expected_counter)
+                    .await
+            }
+            Self::Redis(repo) => {
+                repo.resume_nonce_recovery(id, token, expected_counter)
+                    .await
+            }
+        }
+    }
     async fn list_active(&self) -> Result<Vec<RelayerRepoModel>, RepositoryError> {
         match self {
             RelayerRepositoryStorage::InMemory(repo) => repo.list_active().await,
@@ -336,6 +445,7 @@ mod tests {
 
     fn create_test_relayer(id: String) -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: id.clone(),
             name: format!("Relayer {}", id.clone()),
             network: "TestNet".to_string(),

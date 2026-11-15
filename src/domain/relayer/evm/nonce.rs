@@ -588,7 +588,7 @@ where
     /// - `nonce_health`: Detects and fills nonce gaps with NOOPs
     ///
     /// Returns `Ok(true)` if an action was handled, `Ok(false)` if no recognized action.
-    pub(crate) async fn handle_health_action(
+    pub async fn handle_health_action(
         &self,
         metadata: &HashMap<String, String>,
     ) -> Result<bool, RelayerError> {
@@ -598,6 +598,10 @@ where
         };
 
         match action {
+            super::recovery::RECOVERY_ACTION => {
+                self.recover_nonce_hold().await?;
+                Ok(true)
+            }
             HEALTH_CHECK_ACTION_NONCE_HEALTH => {
                 let nonce_hint = metadata
                     .get(HEALTH_CHECK_NONCE_HINT_KEY)
@@ -750,6 +754,7 @@ mod tests {
 
     fn create_test_relayer() -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer-id".to_string(),
             name: "test-relayer".to_string(),
             network: "mainnet".to_string(),

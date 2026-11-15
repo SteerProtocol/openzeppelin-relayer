@@ -983,6 +983,7 @@ mod tests {
     async fn test_process_single_relayer_success() {
         let transaction_repo = Arc::new(InMemoryTransactionRepository::new());
         let relayer = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer".to_string(),
             name: "Test Relayer".to_string(),
             network: "ethereum".to_string(),
@@ -1027,6 +1028,7 @@ mod tests {
         // Create a relayer with no transactions in the repo
         let transaction_repo = Arc::new(InMemoryTransactionRepository::new());
         let relayer = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "empty-relayer".to_string(),
             name: "Empty Relayer".to_string(),
             network: "ethereum".to_string(),
@@ -1070,6 +1072,7 @@ mod tests {
             .returning(|_| Err(RepositoryError::Other("reconcile failed".to_string())));
 
         let relayer = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer".to_string(),
             name: "Test Relayer".to_string(),
             network: "ethereum".to_string(),
@@ -1415,6 +1418,7 @@ mod tests {
     async fn test_process_single_relayer_processes_all_final_statuses() {
         let transaction_repo = Arc::new(InMemoryTransactionRepository::new());
         let relayer = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer".to_string(),
             name: "Test Relayer".to_string(),
             network: "ethereum".to_string(),

@@ -232,6 +232,7 @@ mod tests {
 
     fn create_test_relayer(paused: bool, system_disabled: bool) -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test_relayer".to_string(),
             name: "Test Relayer".to_string(),
             paused,

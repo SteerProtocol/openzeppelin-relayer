@@ -538,6 +538,7 @@ mod tests {
         }]);
 
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer-id".to_string(),
             name: "Test Relayer".to_string(),
             network: "testnet".to_string(),

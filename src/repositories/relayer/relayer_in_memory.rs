@@ -108,6 +108,7 @@ impl RelayerRepository for InMemoryRelayerRepository {
         if let Some(relayer) = store.get_mut(&id) {
             if let Some(paused) = update.paused {
                 relayer.paused = paused;
+                relayer.nonce_recovery_hold = None;
             }
             Ok(relayer.clone())
         } else {
@@ -115,6 +116,40 @@ impl RelayerRepository for InMemoryRelayerRepository {
                 "Relayer with ID {id} not found"
             )))
         }
+    }
+
+    async fn hold_for_nonce_recovery(
+        &self,
+        id: String,
+        token: String,
+    ) -> Result<RelayerRepoModel, RepositoryError> {
+        let mut store = Self::acquire_lock(&self.store).await?;
+        let r = store
+            .get_mut(&id)
+            .ok_or_else(|| RepositoryError::NotFound(id))?;
+        if !r.paused {
+            r.paused = true;
+            r.nonce_recovery_hold = Some(token);
+        }
+        Ok(r.clone())
+    }
+
+    async fn resume_nonce_recovery(
+        &self,
+        id: String,
+        token: String,
+        _expected_counter: u64,
+    ) -> Result<bool, RepositoryError> {
+        let mut store = Self::acquire_lock(&self.store).await?;
+        let r = store
+            .get_mut(&id)
+            .ok_or_else(|| RepositoryError::NotFound(id))?;
+        if r.paused && r.nonce_recovery_hold.as_deref() == Some(token.as_str()) {
+            r.paused = false;
+            r.nonce_recovery_hold = None;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     async fn update_policy(
@@ -204,6 +239,13 @@ impl Repository<RelayerRepoModel, String> for InMemoryRelayerRepository {
             // Ensure we update the existing entry
             let mut updated_relayer = relayer;
             updated_relayer.id = id.clone(); // Preserve original ID
+            if let Some(live) = store
+                .get(&id)
+                .filter(|live| live.network_type == crate::models::NetworkType::Evm)
+            {
+                updated_relayer.paused = live.paused;
+                updated_relayer.nonce_recovery_hold = live.nonce_recovery_hold.clone();
+            }
             store.insert(id, updated_relayer.clone());
             Ok(updated_relayer)
         } else {
@@ -276,6 +318,7 @@ mod tests {
 
     fn create_test_relayer(id: String) -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: id.clone(),
             name: format!("Relayer {}", id.clone()),
             network: "TestNet".to_string(),
@@ -524,6 +567,7 @@ mod tests {
 
         // Create test relayers with different signers
         let relayer1 = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "relayer-1".to_string(),
             name: "Relayer 1".to_string(),
             network: "ethereum".to_string(),
@@ -539,6 +583,7 @@ mod tests {
         };
 
         let relayer2 = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "relayer-2".to_string(),
             name: "Relayer 2".to_string(),
             network: "polygon".to_string(),
@@ -554,6 +599,7 @@ mod tests {
         };
 
         let relayer3 = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "relayer-3".to_string(),
             name: "Relayer 3".to_string(),
             network: "solana".to_string(),
@@ -569,6 +615,7 @@ mod tests {
         };
 
         let relayer4 = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "relayer-4".to_string(),
             name: "Relayer 4".to_string(),
             network: "stellar".to_string(),
@@ -650,6 +697,7 @@ mod tests {
 
         // Create test relayers with different notifications
         let relayer1 = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "relayer-1".to_string(),
             name: "Relayer 1".to_string(),
             network: "ethereum".to_string(),
@@ -665,6 +713,7 @@ mod tests {
         };
 
         let relayer2 = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "relayer-2".to_string(),
             name: "Relayer 2".to_string(),
             network: "polygon".to_string(),
@@ -680,6 +729,7 @@ mod tests {
         };
 
         let relayer3 = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "relayer-3".to_string(),
             name: "Relayer 3".to_string(),
             network: "solana".to_string(),
@@ -695,6 +745,7 @@ mod tests {
         };
 
         let relayer4 = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "relayer-4".to_string(),
             name: "Relayer 4".to_string(),
             network: "stellar".to_string(),
@@ -710,6 +761,7 @@ mod tests {
         };
 
         let relayer5 = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "relayer-5".to_string(),
             name: "Relayer 5".to_string(),
             network: "bsc".to_string(),

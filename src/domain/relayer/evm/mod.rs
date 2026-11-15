@@ -4,6 +4,7 @@
 /// relaying transactions and events between different EVM networks.
 mod evm_relayer;
 mod nonce;
+mod recovery;
 mod rpc_utils;
 mod validations;
 

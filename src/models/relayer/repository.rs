@@ -32,6 +32,10 @@ impl RelayerRepoUpdater {
         updated.address = self.original.address;
         updated.system_disabled = self.original.system_disabled;
         updated.disabled_reason = self.original.disabled_reason;
+        if self.original.network_type == NetworkType::Evm {
+            updated.paused = self.original.paused;
+            updated.nonce_recovery_hold = self.original.nonce_recovery_hold;
+        }
         updated
     }
 }
@@ -42,6 +46,9 @@ pub struct RelayerRepoModel {
     pub name: String,
     pub network: String,
     pub paused: bool,
+    /// Automatic holds carry a token; manual pauses never grant automatic resume.
+    #[serde(default)]
+    pub nonce_recovery_hold: Option<String>,
     pub network_type: NetworkType,
     pub signer_id: String,
     pub policies: RelayerNetworkPolicy,
@@ -73,6 +80,7 @@ impl Default for RelayerRepoModel {
             name: "".to_string(),
             network: "".to_string(),
             paused: false,
+            nonce_recovery_hold: None,
             network_type: NetworkType::Evm,
             signer_id: "".to_string(),
             policies: RelayerNetworkPolicy::Evm(RelayerEvmPolicy::default()),
@@ -108,6 +116,7 @@ impl From<Relayer> for RelayerRepoModel {
             name: relayer.name,
             network: relayer.network,
             paused: relayer.paused,
+            nonce_recovery_hold: None,
             network_type: relayer.network_type,
             signer_id: relayer.signer_id,
             policies: relayer.policies.unwrap_or_else(|| {
@@ -144,6 +153,7 @@ mod tests {
 
     fn create_test_relayer(paused: bool, system_disabled: bool) -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test_relayer".to_string(),
             name: "Test Relayer".to_string(),
             paused,
@@ -161,6 +171,7 @@ mod tests {
 
     fn create_test_relayer_solana(paused: bool, system_disabled: bool) -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test_solana_relayer".to_string(),
             name: "Test Solana Relayer".to_string(),
             paused,
@@ -190,6 +201,7 @@ mod tests {
 
     fn create_test_relayer_stellar(paused: bool, system_disabled: bool) -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test_stellar_relayer".to_string(),
             name: "Test Stellar Relayer".to_string(),
             paused,
@@ -583,6 +595,7 @@ mod tests {
     fn test_relayer_repo_updater_preserves_runtime_fields() {
         // Create an original relayer with runtime fields set
         let original = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test_relayer".to_string(),
             name: "Original Name".to_string(),
             address: "0x742d35Cc6634C0532925a3b8D8C2e48a73F6ba2E".to_string(), // Runtime field
@@ -618,7 +631,10 @@ mod tests {
 
         // Verify business fields were updated
         assert_eq!(updated.name, "Updated Name");
-        assert!(updated.paused);
+        assert!(
+            !updated.paused,
+            "EVM runtime pause state is changed through the atomic pause endpoint"
+        );
         assert_eq!(
             updated.notification_id,
             Some("new_notification".to_string())
@@ -642,6 +658,7 @@ mod tests {
     fn test_relayer_repo_updater_preserves_runtime_fields_solana() {
         // Create an original Solana relayer with runtime fields set
         let original = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test_solana_relayer".to_string(),
             name: "Original Solana Name".to_string(),
             address: "SolanaOriginalAddress123".to_string(), // Runtime field
@@ -708,6 +725,7 @@ mod tests {
     fn test_relayer_repo_updater_preserves_runtime_fields_stellar() {
         // Create an original Stellar relayer with runtime fields set
         let original = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test_stellar_relayer".to_string(),
             name: "Original Stellar Name".to_string(),
             address: "GORIGINALXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX".to_string(), // Runtime field

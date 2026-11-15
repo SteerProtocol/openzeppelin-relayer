@@ -1638,6 +1638,7 @@ mod tests {
 
     fn create_test_relayer_with_policy(evm_policy: RelayerEvmPolicy) -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer-id".to_string(),
             name: "Test Relayer".to_string(),
             network: "mainnet".to_string(),

@@ -216,6 +216,7 @@ pub fn create_xdr_with_operations(
 
 pub fn create_test_relayer() -> RelayerRepoModel {
     RelayerRepoModel {
+        nonce_recovery_hold: None,
         id: "relayer-1".to_string(),
         name: "Test Relayer".to_string(),
         network: "testnet".to_string(),

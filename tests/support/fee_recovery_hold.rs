@@ -148,7 +148,14 @@ impl JobProducerTrait for Never {
         j: RelayerHealthCheck,
         at: Option<i64>,
     ) -> Result<(), JobProducerError> {
-        panic!("unexpected health enqueue")
+        assert_eq!(
+            j.metadata
+                .as_ref()
+                .and_then(|m| m.get("health_check_action"))
+                .map(String::as_str),
+            Some("nonce_receipt_recovery")
+        );
+        Ok(())
     }
 }
 use openzeppelin_relayer::jobs::TransactionRequest as TransactionRequestJob;
