@@ -30,6 +30,7 @@ pub mod mockutils {
 
     pub fn create_mock_solana_relayer(id: String, paused: bool) -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: id.clone(),
             name: format!("Relayer {}", id.clone()),
             network: "test".to_string(),
@@ -50,6 +51,7 @@ pub mod mockutils {
 
     pub fn create_mock_relayer(id: String, paused: bool) -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: id.clone(),
             name: format!("Relayer {}", id.clone()),
             network: "test".to_string(),

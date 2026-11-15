@@ -328,6 +328,15 @@ impl RelayerHealthCheck {
         self
     }
 
+    pub fn nonce_receipt_recovery(relayer_id: String) -> Self {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            HEALTH_CHECK_ACTION_KEY.to_string(),
+            "nonce_receipt_recovery".to_string(),
+        );
+        Self::new(relayer_id).with_metadata(metadata)
+    }
+
     /// Creates a nonce health check job for the given relayer.
     /// Pre-populates metadata with the nonce health action key.
     pub fn nonce_health(relayer_id: String) -> Self {

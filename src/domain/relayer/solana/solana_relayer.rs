@@ -1385,6 +1385,7 @@ mod tests {
             let transaction_repository = Arc::new(MockTransactionRepository::new());
 
             let relayer_model = RelayerRepoModel {
+                nonce_recovery_hold: None,
                 id: "test-id".to_string(),
                 address: "...".to_string(),
                 network: "devnet".to_string(),
@@ -1489,6 +1490,7 @@ mod tests {
 
     fn create_test_relayer() -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer-id".to_string(),
             address: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
             notification_id: Some("test-notification-id".to_string()),
@@ -2672,6 +2674,7 @@ mod tests {
         let signer = MockSolanaSignTrait::new();
 
         let relayer_model = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer-id".to_string(),
             address: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
             network: "devnet".to_string(),
@@ -2945,6 +2948,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_transaction_request_status_check_failure_returns_error() {
         let relayer_model = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer-id".to_string(),
             address: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
             network: "devnet".to_string(),
@@ -3004,6 +3008,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_transaction_request_status_check_failure_marks_tx_failed() {
         let relayer_model = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer-id".to_string(),
             address: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
             network: "devnet".to_string(),

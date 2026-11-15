@@ -130,6 +130,34 @@ pub trait TransactionRepository: Repository<TransactionRepoModel, String> {
         update: TransactionUpdateRequest,
     ) -> Result<TransactionRepoModel, RepositoryError>;
 
+    /// Bounded receipt-recovery owners, independent of transaction-list history.
+    async fn find_nonce_recovery_transactions(
+        &self,
+        relayer_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TransactionRepoModel>, RepositoryError> {
+        Ok(self
+            .find_by_status(relayer_id, &[TransactionStatus::Failed])
+            .await?
+            .into_iter()
+            .filter(|tx| tx.requires_nonce_reconciliation())
+            .take(limit)
+            .collect())
+    }
+
+    /// Receipt-only compare-and-set for an immutable automatic failure. The caller
+    /// must prove canonical confirmed inclusion; this never edits signed intent.
+    async fn reconcile_mined_auto_failure(
+        &self,
+        _expected: TransactionRepoModel,
+        _succeeded: bool,
+        _confirmed_at: String,
+    ) -> Result<TransactionRepoModel, RepositoryError> {
+        Err(RepositoryError::InvalidData(
+            "Receipt reconciliation unavailable".into(),
+        ))
+    }
+
     /// Repairs stale Redis status-index entries whose indexed status diverged from
     /// the persisted transaction body.
     ///
@@ -448,6 +476,41 @@ impl TransactionRepository for TransactionRepositoryStorage {
         match self {
             TransactionRepositoryStorage::InMemory(repo) => repo.update_status(tx_id, status).await,
             TransactionRepositoryStorage::Redis(repo) => repo.update_status(tx_id, status).await,
+        }
+    }
+
+    async fn find_nonce_recovery_transactions(
+        &self,
+        relayer_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TransactionRepoModel>, RepositoryError> {
+        match self {
+            Self::InMemory(repo) => {
+                repo.find_nonce_recovery_transactions(relayer_id, limit)
+                    .await
+            }
+            Self::Redis(repo) => {
+                repo.find_nonce_recovery_transactions(relayer_id, limit)
+                    .await
+            }
+        }
+    }
+
+    async fn reconcile_mined_auto_failure(
+        &self,
+        expected: TransactionRepoModel,
+        succeeded: bool,
+        confirmed_at: String,
+    ) -> Result<TransactionRepoModel, RepositoryError> {
+        match self {
+            Self::InMemory(repo) => {
+                repo.reconcile_mined_auto_failure(expected, succeeded, confirmed_at)
+                    .await
+            }
+            Self::Redis(repo) => {
+                repo.reconcile_mined_auto_failure(expected, succeeded, confirmed_at)
+                    .await
+            }
         }
     }
 

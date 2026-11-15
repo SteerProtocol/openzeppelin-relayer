@@ -175,6 +175,50 @@ impl TransactionRepoModel {
             ..Default::default()
         }
     }
+    /// Dedicated receipt reconciliation bypasses no generic terminal guards.
+    pub fn reconciled_mined_failure(
+        &self,
+        succeeded: bool,
+        confirmed_at: String,
+    ) -> Result<Self, crate::models::RepositoryError> {
+        let data = self
+            .network_data
+            .get_evm_transaction_data()
+            .map_err(|e| crate::models::RepositoryError::InvalidData(e.to_string()))?;
+        if data.nonce.is_none()
+            || data.hash.is_none()
+            || self.is_canceled == Some(true)
+            || matches!(
+                self.status,
+                TransactionStatus::Canceled | TransactionStatus::Expired
+            )
+        {
+            return Err(crate::models::RepositoryError::InvalidData(
+                "Recovery owner has no eligible signed nonce".into(),
+            ));
+        }
+        let mut reconciled = self.clone();
+        reconciled.status = if succeeded {
+            TransactionStatus::Confirmed
+        } else {
+            TransactionStatus::Failed
+        };
+        reconciled.status_reason = Some(
+            if succeeded {
+                "Confirmed on-chain after automatic recovery hold"
+            } else {
+                "Transaction reverted on-chain (receipt status: failed); nonce reconciled"
+            }
+            .into(),
+        );
+        reconciled.confirmed_at = Some(confirmed_at);
+        let seconds =
+            (crate::config::ServerConfig::get_transaction_expiration_hours() * 3600.0) as i64;
+        reconciled.delete_at =
+            Some((chrono::Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339());
+        Ok(reconciled)
+    }
+
     /// Validates the transaction repository model
     ///
     /// # Returns
@@ -2061,6 +2105,7 @@ mod tests {
         });
 
         let relayer_model = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "relayer-id".to_string(),
             name: "Test Relayer".to_string(),
             network: "network-id".to_string(),
@@ -2147,6 +2192,7 @@ mod tests {
         );
 
         let relayer_model = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "relayer-id".to_string(),
             name: "Test Solana Relayer".to_string(),
             network: "network-id".to_string(),
@@ -2226,6 +2272,7 @@ mod tests {
         });
 
         let relayer_model = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "relayer-id".to_string(),
             name: "Test Stellar Relayer".to_string(),
             network: "network-id".to_string(),
@@ -2535,6 +2582,7 @@ mod tests {
         };
 
         let relayer_model = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer".to_string(),
             name: "Test Relayer".to_string(),
             network: "stellar:testnet".to_string(),

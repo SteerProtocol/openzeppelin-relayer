@@ -324,18 +324,29 @@ impl Repository<RelayerRepoModel, String> for RedisRelayerRepository {
 
         let serialized = self.serialize_entity(&updated_entity, |r| &r.id, "relayer")?;
 
-        // Use pipeline for atomic operations
-        let mut pipe = redis::pipe();
-        pipe.atomic();
-        pipe.set(&relayer_key, &serialized);
-        pipe.sadd(self.relayer_list_key(), &id);
-
-        pipe.exec_async(&mut conn)
-            .await
-            .map_err(|e| self.map_redis_error(e, "update_relayer_pipeline"))?;
-
-        debug!(relayer_id = %id, "updated relayer");
-        Ok(updated_entity)
+        // Full configuration writes must not overwrite concurrent operator
+        // pause decisions or restore a revoked automatic recovery token.
+        let result: Option<String> = redis::Script::new(r#"
+            local raw = redis.call('GET', KEYS[1]); if not raw then return false end
+            local kind = redis.call('TYPE', KEYS[2]).ok
+            if kind ~= 'none' and kind ~= 'set' then return redis.error_reply('Relayer list type mismatch') end
+            local live = cjson.decode(raw); local out = cjson.decode(ARGV[1])
+            if live.network_type == 'evm' then
+                out.paused = live.paused; out.nonce_recovery_hold = live.nonce_recovery_hold or cjson.null
+            end
+            local encoded = cjson.encode(out)
+            for k in string.gmatch(ARGV[1], '"([^"]+)"%s*:%s*%[%s*%]') do
+                encoded = string.gsub(encoded, '"'..k..'"%s*:%s*{}', '"'..k..'":[]', 1)
+            end
+            redis.call('SET', KEYS[1], encoded); redis.call('SADD', KEYS[2], out.id)
+            return encoded
+        "#).key(relayer_key).key(self.relayer_list_key()).arg(serialized)
+            .invoke_async(&mut *conn).await.map_err(|e| self.map_redis_error(e, "update_relayer"))?;
+        self.deserialize_entity(
+            &result.ok_or_else(|| RepositoryError::NotFound(id.clone()))?,
+            &id,
+            "relayer",
+        )
     }
 
     async fn delete_by_id(&self, id: String) -> Result<(), RepositoryError> {
@@ -499,16 +510,29 @@ impl RelayerRepository for RedisRelayerRepository {
         id: String,
         update: UpdateRelayerRequest,
     ) -> Result<RelayerRepoModel, RepositoryError> {
-        // First get the current relayer
-        let mut relayer = self.get_by_id(id.clone()).await?;
-
-        // Apply the partial update
-        if let Some(paused) = update.paused {
-            relayer.paused = paused;
-        }
-
-        // Update the relayer
-        self.update(id, relayer).await
+        let mut conn = self
+            .get_connection(self.connections.primary(), "partial_update")
+            .await?;
+        let raw: Option<String> = redis::Script::new(
+            r#"
+            local raw = redis.call('GET', KEYS[1]); if not raw then return false end
+            if ARGV[1] == '' then return raw end
+            local r = cjson.decode(raw)
+            r.paused = ARGV[1] == 'true'; r.nonce_recovery_hold = cjson.null
+            local out = cjson.encode(r)
+            for k in string.gmatch(raw, '"([^"]+)"%s*:%s*%[%s*%]') do
+                out = string.gsub(out, '"'..k..'"%s*:%s*{}', '"'..k..'":[]', 1)
+            end
+            redis.call('SET', KEYS[1], out); return out
+        "#,
+        )
+        .key(self.relayer_key(&id))
+        .arg(update.paused.map(|v| v.to_string()).unwrap_or_default())
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(|e| self.map_redis_error(e, "partial_update"))?;
+        serde_json::from_str(&raw.ok_or_else(|| RepositoryError::NotFound(id))?)
+            .map_err(|e| RepositoryError::InvalidData(e.to_string()))
     }
 
     async fn enable_relayer(
@@ -575,6 +599,7 @@ mod tests {
 
     fn create_test_relayer(id: &str) -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: id.to_string(),
             name: format!("Test Relayer {id}"),
             network: "ethereum".to_string(),
@@ -940,6 +965,7 @@ mod tests {
 
         let create_result = repo
             .create(RelayerRepoModel {
+                nonce_recovery_hold: None,
                 id: "".to_string(),
                 ..create_test_relayer("test")
             })

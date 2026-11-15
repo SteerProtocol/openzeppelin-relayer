@@ -190,8 +190,12 @@ where
         // Early return for Pending/Sent states - these are DB-only states
         // that don't require on-chain queries and may not have a hash yet
         match tx.status {
-            TransactionStatus::Pending | TransactionStatus::Sent => {
-                return Ok(tx.status.clone());
+            TransactionStatus::Pending => return Ok(tx.status.clone()),
+            TransactionStatus::Sent
+                if tx.network_data.get_evm_transaction_data()?.hash.is_none()
+                    || is_transaction_valid(&tx.created_at, &tx.valid_until) =>
+            {
+                return Ok(tx.status.clone())
             }
             _ => {}
         }
@@ -734,18 +738,36 @@ where
         tx: &TransactionRepoModel,
         reason: &str,
     ) -> Result<(), TransactionError> {
-        if !self.relayer().paused {
-            self.relayer_repository()
-                .partial_update(
-                    tx.relayer_id.clone(),
-                    crate::models::UpdateRelayerRequest {
-                        paused: Some(true),
-                        ..Default::default()
-                    },
+        let held = self
+            .relayer_repository()
+            .hold_for_nonce_recovery(tx.relayer_id.clone(), tx.id.clone())
+            .await?;
+        warn!(relayer_id = %tx.relayer_id, tx_id = %tx.id, reason,
+            automatic = held.nonce_recovery_hold.is_some(), "relayer held: allocated nonce requires receipt reconciliation");
+        if held.nonce_recovery_hold.is_some() {
+            self.schedule_receipt_recovery().await?;
+        }
+        Ok(())
+    }
+
+    async fn schedule_receipt_recovery(&self) -> Result<(), TransactionError> {
+        static RECOVERY_ENQUEUE_GATE: OnceLock<TtlDebounce> = OnceLock::new();
+        let gate =
+            RECOVERY_ENQUEUE_GATE.get_or_init(|| TtlDebounce::new(StdDuration::from_secs(30)));
+        if gate.should_fire(&self.relayer().id) {
+            if let Err(error) = self
+                .job_producer()
+                .produce_relayer_health_check_job(
+                    crate::jobs::RelayerHealthCheck::nonce_receipt_recovery(
+                        self.relayer().id.clone(),
+                    ),
+                    None,
                 )
-                .await?;
-            warn!(relayer_id = %tx.relayer_id, tx_id = %tx.id, reason,
-                "relayer paused: allocated nonce requires operator reconciliation");
+                .await
+            {
+                gate.clear(&self.relayer().id);
+                return Err(TransactionError::UnexpectedError(error.to_string()));
+            }
         }
         Ok(())
     }
@@ -1025,6 +1047,9 @@ where
         // delivery. Keep jobs/nonce ownership intact, but do no RPC recovery
         // work while an operator or the reconciliation circuit has paused it.
         if self.relayer().paused {
+            if self.relayer().nonce_recovery_hold.is_some() {
+                self.schedule_receipt_recovery().await?;
+            }
             return Ok(tx);
         }
 
@@ -1564,7 +1589,11 @@ mod tests {
     pub fn default_test_mocks() -> TestMocks {
         TestMocks {
             provider: MockEvmProviderTrait::new(),
-            relayer_repo: MockRelayerRepository::new(),
+            relayer_repo: {
+                let mut repo = MockRelayerRepository::new();
+                repo.expect_connection_info().returning(|| None);
+                repo
+            },
             network_repo: MockNetworkRepository::new(),
             tx_repo: MockTransactionRepository::new(),
             job_producer: MockJobProducerTrait::new(),
@@ -1722,6 +1751,7 @@ mod tests {
 
     fn create_test_relayer() -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer-id".to_string(),
             name: "Test Relayer".to_string(),
             paused: false,
@@ -1796,6 +1826,35 @@ mod tests {
     // Tests for `check_transaction_status`
     mod check_transaction_status_tests {
         use super::*;
+
+        #[tokio::test]
+        async fn expired_sent_signed_transaction_checks_receipt_before_expiry_failure() {
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+            let mut tx = make_test_transaction(TransactionStatus::Sent);
+            tx.valid_until = Some((Utc::now() - Duration::minutes(1)).to_rfc3339());
+            if let NetworkTransactionData::Evm(ref mut d) = tx.network_data {
+                d.hash = Some("0xFakeHash".into());
+            }
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .times(1)
+                .returning(|_| Box::pin(async { Ok(Some(make_mock_receipt(true, Some(100)))) }));
+            mocks
+                .provider
+                .expect_get_block_number()
+                .return_once(|| Box::pin(async { Ok(113) }));
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+            let handler = make_test_evm_relayer_transaction(relayer, mocks);
+            assert_eq!(
+                handler.check_transaction_status(&tx).await.unwrap(),
+                TransactionStatus::Confirmed
+            );
+        }
 
         #[tokio::test]
         async fn test_not_mined() {

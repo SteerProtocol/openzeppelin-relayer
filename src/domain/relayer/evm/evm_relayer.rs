@@ -701,6 +701,14 @@ where
     )]
     async fn initialize_relayer(&self) -> Result<(), RelayerError> {
         debug!("initializing EVM relayer");
+        if self.relayer.paused && self.relayer.nonce_recovery_hold.is_some() {
+            self.job_producer
+                .produce_relayer_health_check_job(
+                    RelayerHealthCheck::nonce_receipt_recovery(self.relayer.id.clone()),
+                    Some(calculate_scheduled_timestamp(60)),
+                )
+                .await?;
+        }
 
         match self.check_health().await {
             Ok(_) => {
@@ -847,6 +855,7 @@ mod tests {
 
     fn create_test_relayer() -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer-id".to_string(),
             name: "Test Relayer".to_string(),
             network: "mainnet".to_string(), // Changed from "1" to "mainnet"

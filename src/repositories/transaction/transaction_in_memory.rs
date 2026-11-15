@@ -405,6 +405,27 @@ impl TransactionRepository for InMemoryTransactionRepository {
         self.partial_update(tx_id, update).await
     }
 
+    async fn reconcile_mined_auto_failure(
+        &self,
+        expected: TransactionRepoModel,
+        succeeded: bool,
+        confirmed_at: String,
+    ) -> Result<TransactionRepoModel, RepositoryError> {
+        let mut store = Self::acquire_lock(&self.store).await?;
+        let current = store
+            .get_mut(&expected.id)
+            .ok_or_else(|| RepositoryError::NotFound(expected.id.clone()))?;
+        if !current.requires_nonce_reconciliation()
+            || serde_json::to_value(&*current).ok() != serde_json::to_value(&expected).ok()
+        {
+            return Err(RepositoryError::ConstraintViolation(
+                "Recovery snapshot changed".into(),
+            ));
+        }
+        *current = current.reconciled_mined_failure(succeeded, confirmed_at)?;
+        Ok(current.clone())
+    }
+
     async fn partial_update(
         &self,
         tx_id: String,

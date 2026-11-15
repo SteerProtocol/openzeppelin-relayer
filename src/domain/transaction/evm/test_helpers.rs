@@ -102,6 +102,7 @@ pub mod test_utils {
     /// Creates a test relayer with default configuration
     pub fn create_test_relayer() -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer-id".to_string(),
             name: "Test Relayer".to_string(),
             paused: false,

@@ -732,6 +732,7 @@ mod tests {
 
         // Create a relayer that uses this notification
         let relayer = crate::models::RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer".to_string(),
             name: "Test Relayer".to_string(),
             network: "ethereum".to_string(),
@@ -779,6 +780,7 @@ mod tests {
 
         // Create a relayer that uses this notification
         let relayer = crate::models::RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "temp-relayer".to_string(),
             name: "Temporary Relayer".to_string(),
             network: "ethereum".to_string(),
@@ -836,6 +838,7 @@ mod tests {
         // Create multiple relayers that use this notification
         let relayers = vec![
             crate::models::RelayerRepoModel {
+                nonce_recovery_hold: None,
                 id: "relayer-1".to_string(),
                 name: "EVM Relayer".to_string(),
                 network: "ethereum".to_string(),
@@ -852,6 +855,7 @@ mod tests {
                 ..Default::default()
             },
             crate::models::RelayerRepoModel {
+                nonce_recovery_hold: None,
                 id: "relayer-2".to_string(),
                 name: "Solana Relayer".to_string(),
                 network: "solana".to_string(),
@@ -868,6 +872,7 @@ mod tests {
                 ..Default::default()
             },
             crate::models::RelayerRepoModel {
+                nonce_recovery_hold: None,
                 id: "relayer-3".to_string(),
                 name: "Stellar Relayer".to_string(),
                 network: "stellar".to_string(),
@@ -931,6 +936,7 @@ mod tests {
 
         // Create relayers - only one uses the notification we want to delete
         let relayer1 = crate::models::RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "blocking-relayer".to_string(),
             name: "Blocking Relayer".to_string(),
             network: "ethereum".to_string(),
@@ -948,6 +954,7 @@ mod tests {
         };
 
         let relayer2 = crate::models::RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "non-blocking-relayer".to_string(),
             name: "Non-blocking Relayer".to_string(),
             network: "polygon".to_string(),
@@ -965,6 +972,7 @@ mod tests {
         };
 
         let relayer3 = crate::models::RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "no-notification-relayer".to_string(),
             name: "No Notification Relayer".to_string(),
             network: "bsc".to_string(),

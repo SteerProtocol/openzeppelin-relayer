@@ -971,6 +971,7 @@ mod tests {
     fn test_empty_policies_not_returned_in_response() {
         // Create a repository model with empty policies (all None - user didn't set any)
         let repo_model = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer".to_string(),
             name: "Test Relayer".to_string(),
             network: "mainnet".to_string(),
@@ -1003,6 +1004,7 @@ mod tests {
     fn test_empty_solana_policies_not_returned_in_response() {
         // Create a repository model with empty Solana policies (all None - user didn't set any)
         let repo_model = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-solana-relayer".to_string(),
             name: "Test Solana Relayer".to_string(),
             network: "mainnet".to_string(),
@@ -1035,6 +1037,7 @@ mod tests {
     fn test_empty_stellar_policies_not_returned_in_response() {
         // Create a repository model with empty Stellar policies (all None - user didn't set any)
         let repo_model = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-stellar-relayer".to_string(),
             name: "Test Stellar Relayer".to_string(),
             network: "mainnet".to_string(),
@@ -1067,6 +1070,7 @@ mod tests {
     fn test_user_provided_policies_returned_in_response() {
         // Create a repository model with user-provided policies
         let repo_model = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer".to_string(),
             name: "Test Relayer".to_string(),
             network: "mainnet".to_string(),
@@ -1111,6 +1115,7 @@ mod tests {
     fn test_user_provided_solana_policies_returned_in_response() {
         // Create a repository model with user-provided Solana policies
         let repo_model = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-solana-relayer".to_string(),
             name: "Test Solana Relayer".to_string(),
             network: "mainnet".to_string(),
@@ -1163,6 +1168,7 @@ mod tests {
     fn test_user_provided_stellar_policies_returned_in_response() {
         // Create a repository model with user-provided Stellar policies
         let repo_model = RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-stellar-relayer".to_string(),
             name: "Test Stellar Relayer".to_string(),
             network: "mainnet".to_string(),

@@ -779,6 +779,7 @@ mod tests {
 
     fn create_mock_relayer() -> RelayerRepoModel {
         RelayerRepoModel {
+            nonce_recovery_hold: None,
             id: "test-relayer".to_string(),
             name: "Test Relayer".to_string(),
             network: "mainnet".to_string(),
